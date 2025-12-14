@@ -309,7 +309,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ----------------- MAIN -----------------
 def main():
-    token = "8403692899:AAGqYW4zObZD8631cn6XF-_YfJjrFsLLHPc"  # অথবা সরাসরি "YOUR_TOKEN"
+    token = "8361665792:AAGstcAFS4t7MO6WXojLiYaPPJqu7BYLavw"  # অথবা সরাসরি "YOUR_TOKEN"
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -333,3 +333,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
