@@ -1,3 +1,4 @@
+#leteste_varsion_date_15/12/25
 import logging, os, asyncio, re
 from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -14,47 +15,89 @@ QUIZ_DELIMITER = "n"
 
 OPTION_LABEL_RE = re.compile(r"^\s*(\([a-jA-J]\)|[a-jA-J][\.\)])\s+")
 
+def clean_options(options):
+    cleaned = []
+    for opt in options:
+        opt = re.sub(r"^\s*(\([a-dA-D]\)|[a-dA-D][\.\)])\s*", "", opt)
+        cleaned.append(opt.strip())
+    return cleaned
+
+import random
+
+def shuffle_options(options, correct_idx):
+    indexed = list(enumerate(options))   # [(0,opt0),(1,opt1)...]
+    random.shuffle(indexed)
+
+    new_options = []
+    new_correct_idx = 0
+
+    for new_i, (old_i, opt) in enumerate(indexed):
+        new_options.append(opt)
+        if old_i == correct_idx:
+            new_correct_idx = new_i
+
+    return new_options, new_correct_idx
+
+def clean_question(text: str) -> str:
+    text = text.strip()
+
+    # শুরুতে থাকা [ ... ] কাটা
+    text = re.sub(r"^\s*(\[[^\]]*\]\s*)+", "", text)
+
+    # শুরুতে সিরিয়াল নাম্বার কাটা
+    # 17। | 1. | 12: | 78| | 1) | Q12.
+    text = re.sub(r"^\s*(Q?\d+[\.\:\|\)|।-]?\s*)+", "", text)
+
+    # শেষে থাকা [ ... ] কাটা
+    text = re.sub(r"\s*\[[^\]]*\]\s*$", "", text)
+
+    # extra space clean
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
 # ----------------- PARSER -----------------
-def parse_single_quiz_block(block: str):
-    lines = [l.strip() for l in block.splitlines() if l.strip()]
-    if len(lines) < 3:
-        raise ValueError("❌ প্রশ্ন + অন্তত ২টি অপশন থাকতে হবে।")
-    question = lines[0]
-    rest_lines = lines[1:]
-    options, explanation_lines = [], []
-    correct_idx, explanation_started = -1, False
-    for raw_line in rest_lines:
-        line = raw_line.strip()
-        if not line: continue
-        if not explanation_started:
-            has_star = "*" in line
-            clean_line = line.replace("*", "").strip()
-            has_option_label = OPTION_LABEL_RE.match(clean_line) is not None
-            if has_star or has_option_label or len(options) < 2:
-                options.append(clean_line)
-                if has_star:
-                    if correct_idx != -1:
-                        raise ValueError("❌ একাধিক সঠিক উত্তর দেওয়া হয়েছে।")
-                    correct_idx = len(options) - 1
-            else:
-                explanation_started = True
-                explanation_lines.append(line)
-        else:
+def parse_quiz_block(block: str):
+    lines = [line.strip() for line in block.split("\n") if line.strip()]
+    question = None
+    options = []
+    explanation_lines = []
+    correct_idx = 0
+
+    for line in lines:
+        # Option detect: (a)/(A) ইত্যাদি
+        if re.match(r"^\(?[a-dA-D]\)?", line):
+            opt_text = re.sub(r"^\(?[a-dA-D]\)?\s*", "", line)
+            if "*" in opt_text:
+                opt_text = opt_text.replace("*", "")
+                correct_idx = len(options)
+            options.append(opt_text.strip())
+        elif line.startswith("ব্যাখ্যা"):
             explanation_lines.append(line)
-    if correct_idx == -1:
-        raise ValueError("❌ সঠিক উত্তর `*` দিয়ে চিহ্নিত করতে হবে।")
-    if len(options) < 2:
-        raise ValueError("❌ কমপক্ষে ২টি অপশন থাকতে হবে।")
-    if len(options) > 10:
-        raise ValueError("❌ Telegram quiz সর্বোচ্চ ১০টি অপশন নিতে পারে।")
-    return question, options, correct_idx, "\n".join(explanation_lines).strip()
+        elif line.lower() == "n":
+            continue
+        else:
+            # প্রথম non-option লাইনকে question ধরো
+            if question is None:
+                question = clean_question(line)
+            else:
+                explanation_lines.append(line)
+
+    if not question or not options:
+        return None  # ❌ কোনো কুইজ পাওয়া যায়নি
+
+    explanation = " ".join(explanation_lines).strip()
+    return question, options, correct_idx, explanation
+
+
+
 
 def parse_multiple_quizzes(raw_text: str):
-    quiz_blocks = [b.strip() for b in raw_text.split(f"\n{QUIZ_DELIMITER}\n") if b.strip()]
+    quiz_blocks = [b.strip() for b in re.split(r"\n\s*n\s*\n",raw_text) if b.strip()]
     parsed, errors = [], []
     for i, block in enumerate(quiz_blocks, start=1):
         try:
-            q, opts, idx, exp = parse_single_quiz_block(block)
+            q, opts, idx, exp = parse_quiz_block(block)
             parsed.append({
                 "question": f"{QUESTION_PREFIX}\n{q}",
                 "options": opts,
@@ -207,8 +250,8 @@ async def extract_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         correct_idx = poll.correct_option_id if poll.correct_option_id is not None else 0
 
         # পুরনো prefix থাকলে সরাও
-        if question.startswith("["):
-            question = re.sub(r"^\[.*?\]\s*\n*", "", question).strip()
+        question = clean_question(poll.question)
+
 
         # নতুন prefix বসাও
         final_question = f"{QUESTION_PREFIX}\n\n{question}"
@@ -249,14 +292,27 @@ async def extract_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     ok, bad = 0, 0
     for poll in FORWARDED_POLLS:
-        question = poll.question
-        options = [opt.text for opt in poll.options]
+    # প্রশ্ন আগের মতোই clean
+        question = clean_question(poll.question)
+
+    # ✅ এখানেই অপশন clean + split হবে
+        raw_options = [opt.text for opt in poll.options]
+
+        # 1️⃣ অপশন clean
+        options = clean_options(raw_options)
+
+        # 2️⃣ correct index আগের মতো নাও
         correct_idx = poll.correct_option_id if poll.correct_option_id is not None else 0
 
+        # 3️⃣ অপশন shuffle + correct index ঠিক করা
+        options, correct_idx = shuffle_options(options, correct_idx)
+
+
+
         # prefix বসাও
-        if question.startswith("["):
-            question = re.sub(r"^\[.*?\]\s*\n*", "", question).strip()
-        final_question = f"{QUESTION_PREFIX}\n\n{question}"
+        question = clean_question(poll.question)
+
+        final_question = f"{QUESTION_PREFIX}\n{question}"
         final_explanation = AUTO_EXPLANATION_LINK
 
         try:
@@ -294,7 +350,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  • /setexplanation &lt;text&gt; → explanation link পরিবর্তন করুন\n\n"
         "🧠 <b>Quiz Creation</b>\n"
         "  • /createquiz → কুইজ ফরমেট রিপ্লাই করে দিন, তারপর target বেছে নিন\n"
-        "  • /extractquiz → ফরোয়ার্ড করা quiz রিপ্লাই করে নতুন prefix সহ বানান\n"
         "  • /extractbatch → একসাথে অনেক forwarded quiz প্রসেস করুন\n\n"
         "ℹ️ <b>General</b>\n"
         "  • /start → বট শুরু করুন\n"
@@ -309,7 +364,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ----------------- MAIN -----------------
 def main():
-    token = "8361665792:AAGstcAFS4t7MO6WXojLiYaPPJqu7BYLavw"  # অথবা সরাসরি "YOUR_TOKEN"
+    token = "8361665792:AAFDRGmPrBX_ycKts4ci1lHMfgQwI83DEBs"  # অথবা সরাসরি "YOUR_TOKEN"
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -333,4 +388,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
