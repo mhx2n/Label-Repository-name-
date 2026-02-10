@@ -17,9 +17,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     PollAnswer,
 )
-from aiogram.exceptions import TelegramBadRequest
-
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import cm
@@ -31,7 +30,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 # =========================================================
 #  CODE-FIXED CONFIG (NO ENV, NO CLAIM OWNER)
 # =========================================================
-BOT_TOKEN = "8427023407:AAFagu6UcMGJAI2_jJksQTZ0P_Hj9JQTWrI"  # ✅ fixed bot token (STR)
+BOT_TOKEN = "8427023407:AAFagu6UcMGJAI2_jJksQTZ0P_Hj9JQTWrI"  # <-- paste token here (keep quotes)
 
 OWNER_ID = 8389621809  # ✅ fixed owner (INT)
 
@@ -41,27 +40,22 @@ INTERNAL_ADMINS: Set[int] = {
     # 222222222,
 }
 
-# Contacts shown to non-authorized users
 CONTACT_OWNER_1 = "@Your_Himus"
 CONTACT_OWNER_2 = "@Probaho_Robot"
 
-# Defaults
 DEFAULT_TIME_PER_Q = 30
 DEFAULT_MARK_PER_Q = 1.0
 DEFAULT_NEGATIVE = 0.25
 
-# Data dir
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Fonts directory (put Bangla + Emoji fonts here)
 FONTS_DIR = "fonts"
 os.makedirs(FONTS_DIR, exist_ok=True)
 
-# Recommended font files (place inside ./fonts)
-# - NotoSansBengali-Regular.ttf  (Bangla)
-# - NotoEmoji-Regular.ttf        (Emoji monochrome; works better for PDF than color emoji)
-# If not found, bot falls back to common Windows fonts.
+# Put fonts inside ./fonts (recommended for perfect Bangla/emoji)
+# - fonts/NotoSansBengali-Regular.ttf  (Bangla)
+# - fonts/NotoEmoji-Regular.ttf        (Emoji mono; best for PDF)
 BENGALI_FONT_FILES = [
     os.path.join(FONTS_DIR, "NotoSansBengali-Regular.ttf"),
     os.path.join(FONTS_DIR, "SolaimanLipi.ttf"),
@@ -70,7 +64,7 @@ BENGALI_FONT_FILES = [
 ]
 EMOJI_FONT_FILES = [
     os.path.join(FONTS_DIR, "NotoEmoji-Regular.ttf"),
-    "C:/Windows/Fonts/seguiemj.ttf",  # Segoe UI Emoji (Windows)
+    "C:/Windows/Fonts/seguiemj.ttf",
 ]
 LATIN_FONT_FILES = [
     "C:/Windows/Fonts/segoeui.ttf",
@@ -79,9 +73,9 @@ LATIN_FONT_FILES = [
     "C:/Windows/Fonts/calibri.ttf",
 ]
 
-GROUPS_FILE = os.path.join(DATA_DIR, "groups.json")       # bound groups
-PRESETS_FILE = os.path.join(DATA_DIR, "presets.json")     # per-group exam presets
-QUESTIONS_FILE = os.path.join(DATA_DIR, "questions.json") # question bank
+GROUPS_FILE = os.path.join(DATA_DIR, "groups.json")
+PRESETS_FILE = os.path.join(DATA_DIR, "presets.json")
+QUESTIONS_FILE = os.path.join(DATA_DIR, "questions.json")
 
 
 # =========================================================
@@ -92,7 +86,6 @@ class Question:
     text: str
     options: List[str]
     correct_id: int  # 0..3
-    # where poll was posted (for links)
     source_chat_id: Optional[int] = None
     source_message_id: Optional[int] = None
 
@@ -131,7 +124,7 @@ class ExamSession:
     current_index: int = 0
 
     poll_id_to_q_idx: Dict[str, int] = field(default_factory=dict)
-    posted_message_ids: Dict[int, int] = field(default_factory=dict)  # q_idx -> message_id in group
+    posted_message_ids: Dict[int, int] = field(default_factory=dict)  # q_idx -> msg_id
 
     intro_message_id: Optional[int] = None
     pin_cleanup_until: Optional[datetime] = None
@@ -146,15 +139,9 @@ class ExamSession:
 router = Router()
 EXAMS: Dict[int, ExamSession] = {}
 
-# DM announcement draft (admin_id -> (chat_id, msg_id))
 ANNOUNCE_DRAFT: Dict[int, Tuple[int, int]] = {}
-# DM last content cache (admin_id -> (chat_id, msg_id))
 LAST_DM_CONTENT: Dict[int, Tuple[int, int]] = {}
-
-# Wizard state (admin_id -> dict)
 WIZARD: Dict[int, Dict[str, Any]] = {}
-
-# Scheduled jobs
 SCHEDULE_TASKS: Dict[Tuple[int, str], asyncio.Task] = {}
 
 
@@ -170,23 +157,29 @@ def _load_json(path: str, default):
     except Exception:
         return default
 
+
 def _save_json(path: str, data) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
+
 def load_groups() -> Dict[str, Dict[str, Any]]:
     return _load_json(GROUPS_FILE, {})
+
 
 def save_groups(d: Dict[str, Dict[str, Any]]) -> None:
     _save_json(GROUPS_FILE, d)
 
+
 def load_presets() -> Dict[str, Dict[str, Any]]:
     return _load_json(PRESETS_FILE, {})
 
+
 def save_presets(d: Dict[str, Dict[str, Any]]) -> None:
     _save_json(PRESETS_FILE, d)
+
 
 def load_questions() -> List[Question]:
     raw = _load_json(QUESTIONS_FILE, [])
@@ -206,6 +199,7 @@ def load_questions() -> List[Question]:
             continue
     return out
 
+
 def save_questions(qs: List[Question]) -> None:
     raw = []
     for q in qs:
@@ -220,6 +214,7 @@ def save_questions(qs: List[Question]) -> None:
         )
     _save_json(QUESTIONS_FILE, raw)
 
+
 QUESTION_BANK: List[Question] = load_questions()
 
 
@@ -229,8 +224,13 @@ QUESTION_BANK: List[Question] = load_questions()
 def is_internal_admin(user_id: int) -> bool:
     return user_id == OWNER_ID or user_id in INTERNAL_ADMINS
 
+
 def unauthorized_text() -> str:
-    return f"⚠️ You are not allowed to use this bot.\nContact {CONTACT_OWNER_1} / {CONTACT_OWNER_2}"
+    return (
+        "⚠️ You are not allowed to use this bot.\n"
+        f"Contact {CONTACT_OWNER_1} / {CONTACT_OWNER_2}"
+    )
+
 
 async def deny_and_warn(message: Message, bot: Bot, delete_in_group: bool = True):
     try:
@@ -245,18 +245,14 @@ async def deny_and_warn(message: Message, bot: Bot, delete_in_group: bool = True
 
 
 # =========================================================
-#  UTILS: Links
+#  LINKS
 # =========================================================
 def make_message_link(chat_id: int, msg_id: int, public_username: Optional[str]) -> str:
-    # public group: https://t.me/<username>/<msg_id>
     if public_username:
         return f"https://t.me/{public_username}/{msg_id}"
-    # private/supergroup: https://t.me/c/<internal>/<msg_id>
-    # internal id is chat_id without -100 prefix
     if str(chat_id).startswith("-100"):
         internal = str(chat_id)[4:]
         return f"https://t.me/c/{internal}/{msg_id}"
-    # fallback
     return ""
 
 
@@ -288,6 +284,7 @@ def kb_groups(page: int = 0, per_page: int = 6, prefix: str = "grp") -> InlineKe
     rows.append([InlineKeyboardButton(text="Close", callback_data=f"{prefix}:close")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+
 def kb_admin_panel() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="📌 Groups", callback_data="panel:groups:0")],
@@ -297,6 +294,7 @@ def kb_admin_panel() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="❌ Close", callback_data="panel:close")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 def kb_group_actions(gid: str) -> InlineKeyboardMarkup:
     rows = [
@@ -309,6 +307,7 @@ def kb_group_actions(gid: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="↩️ Back", callback_data="panel:groups:0")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 def kb_schedule(gid: str) -> InlineKeyboardMarkup:
     rows = [
@@ -323,6 +322,7 @@ def kb_schedule(gid: str) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+
 def get_preset(gid: str) -> ExamPreset:
     presets = load_presets()
     d = presets.get(gid) or {}
@@ -334,6 +334,7 @@ def get_preset(gid: str) -> ExamPreset:
         ready=bool(d.get("ready", False)),
     )
 
+
 def save_preset(gid: str, p: ExamPreset) -> None:
     presets = load_presets()
     presets[gid] = {
@@ -344,6 +345,7 @@ def save_preset(gid: str, p: ExamPreset) -> None:
         "ready": p.ready,
     }
     save_presets(presets)
+
 
 def preset_text(gid: str) -> str:
     p = get_preset(gid)
@@ -359,7 +361,7 @@ def preset_text(gid: str) -> str:
 
 
 # =========================================================
-#  BASIC DM
+#  DM: /start + Participant guard
 # =========================================================
 @router.message(Command("start"))
 async def cmd_start(message: Message):
@@ -368,26 +370,26 @@ async def cmd_start(message: Message):
 
     if is_internal_admin(message.from_user.id):
         text = (
-            "✅ <b>Extreme Exam Bot</b>"
-            "<b>Admin Panel</b>"
-            "• /admin_panel"
-            "• /question_count"
-            "• /json_template"
-            "• /validate_json (reply to JSON file)"
-            "• /announce /announce_pin (after sending content)"
-            "• /diagnose"
-            "<b>Group Commands</b> (Owner/Admin only)"
-            "• /bind_group"
-            "• /start_exam"
-            "• /stop_exam"
+            "✅ <b>Extreme Exam Bot</b>\n\n"
+            "<b>Admin DM Commands</b>\n"
+            "• /admin_panel\n"
+            "• /question_count\n"
+            "• /json_template\n"
+            "• /validate_json (reply to JSON file)\n"
+            "• /announce /announce_pin (after sending content)\n"
+            "• /diagnose\n\n"
+            "<b>Group Commands</b> (Owner/Admin only)\n"
+            "• /bind_group\n"
+            "• /start_exam\n"
+            "• /stop_exam\n"
         )
     else:
         text = (
-            "✅ <b>Extreme Exam Bot</b>"
-            "This bot is used by the exam owner/admin."
-            "You can participate in exams from the group."
-            "📩 To receive your full exam analysis in DM, please keep this chat open and send /start here (done)."
-            "⚠️ Other commands are not available for participants."
+            "✅ <b>Extreme Exam Bot</b>\n\n"
+            "This bot is used by the exam owner/admin.\n"
+            "You can participate in exams from the group.\n\n"
+            "📩 To receive your full exam analysis in DM, keep this chat open (done).\n"
+            "⚠️ Other commands are not available for participants.\n\n"
             f"Contact {CONTACT_OWNER_1} / {CONTACT_OWNER_2}"
         )
 
@@ -395,13 +397,13 @@ async def cmd_start(message: Message):
 
 
 @router.message(F.chat.type == ChatType.PRIVATE, F.text.startswith("/"))
-async def participant_command_guard(message: Message, bot: Bot):
+async def participant_command_guard(message: Message):
     if is_internal_admin(message.from_user.id):
         return
-    # Allow only /start for participants
     if message.text.strip().startswith("/start"):
         return
     await message.answer(unauthorized_text())
+
 
 @router.message(Command("admin_panel"), F.chat.type == ChatType.PRIVATE)
 async def cmd_admin_panel(message: Message):
@@ -410,6 +412,7 @@ async def cmd_admin_panel(message: Message):
         return
     await message.answer("⚙️ <b>Admin Panel</b>", reply_markup=kb_admin_panel())
 
+
 @router.message(Command("question_count"))
 async def cmd_question_count(message: Message):
     if message.chat.type == ChatType.PRIVATE and not is_internal_admin(message.from_user.id):
@@ -417,9 +420,11 @@ async def cmd_question_count(message: Message):
         return
     await message.answer(f"📚 Saved Questions: <b>{len(QUESTION_BANK)}</b>")
 
+
 @router.callback_query(F.data == "noop")
 async def cb_noop(call: CallbackQuery):
     await call.answer()
+
 
 @router.callback_query(F.data == "panel:close")
 async def cb_panel_close(call: CallbackQuery):
@@ -428,6 +433,7 @@ async def cb_panel_close(call: CallbackQuery):
     except Exception:
         pass
     await call.answer()
+
 
 @router.callback_query(F.data.startswith("panel:groups:"))
 async def cb_panel_groups(call: CallbackQuery):
@@ -438,6 +444,7 @@ async def cb_panel_groups(call: CallbackQuery):
     await call.message.edit_text("📌 <b>Select a group</b>", reply_markup=kb_groups(page, prefix="grp"))
     await call.answer()
 
+
 @router.callback_query(F.data == "panel:qcount")
 async def cb_panel_qcount(call: CallbackQuery):
     if not is_internal_admin(call.from_user.id):
@@ -445,6 +452,7 @@ async def cb_panel_qcount(call: CallbackQuery):
         return
     await call.message.edit_text(f"📚 Saved Questions: <b>{len(QUESTION_BANK)}</b>", reply_markup=kb_admin_panel())
     await call.answer()
+
 
 @router.callback_query(F.data == "panel:qclear")
 async def cb_panel_qclear(call: CallbackQuery):
@@ -455,6 +463,7 @@ async def cb_panel_qclear(call: CallbackQuery):
     save_questions(QUESTION_BANK)
     await call.message.edit_text("🧹 Question bank cleared.", reply_markup=kb_admin_panel())
     await call.answer()
+
 
 @router.callback_query(F.data == "panel:announce")
 async def cb_panel_announce(call: CallbackQuery):
@@ -470,11 +479,13 @@ async def cb_panel_announce(call: CallbackQuery):
     await call.message.edit_text(txt, reply_markup=kb_admin_panel())
     await call.answer()
 
+
 @router.callback_query(F.data.startswith("grp:page:"))
 async def cb_grp_page(call: CallbackQuery):
     page = int(call.data.split(":")[-1])
     await call.message.edit_reply_markup(reply_markup=kb_groups(page, prefix="grp"))
     await call.answer()
+
 
 @router.callback_query(F.data == "grp:close")
 async def cb_grp_close(call: CallbackQuery):
@@ -483,6 +494,7 @@ async def cb_grp_close(call: CallbackQuery):
     except Exception:
         pass
     await call.answer()
+
 
 @router.callback_query(F.data.startswith("grp:pick:"))
 async def cb_grp_pick(call: CallbackQuery):
@@ -493,11 +505,13 @@ async def cb_grp_pick(call: CallbackQuery):
     await call.message.edit_text(preset_text(gid), reply_markup=kb_group_actions(gid))
     await call.answer()
 
+
 @router.callback_query(F.data.startswith("g:open:"))
 async def cb_g_open(call: CallbackQuery):
     gid = call.data.split(":")[-1]
     await call.message.edit_text(preset_text(gid), reply_markup=kb_group_actions(gid))
     await call.answer()
+
 
 @router.callback_query(F.data.startswith("g:ready:"))
 async def cb_g_ready(call: CallbackQuery):
@@ -508,12 +522,14 @@ async def cb_g_ready(call: CallbackQuery):
     await call.message.edit_text(preset_text(gid), reply_markup=kb_group_actions(gid))
     await call.answer("READY ✅")
 
+
 @router.callback_query(F.data.startswith("g:setname:"))
 async def cb_g_setname(call: CallbackQuery):
     gid = call.data.split(":")[-1]
     WIZARD[call.from_user.id] = {"mode": "name", "gid": gid, "panel": (call.message.chat.id, call.message.message_id)}
     await call.message.edit_text("📝 Send <b>Exam Name</b> now (type here).")
     await call.answer()
+
 
 @router.callback_query(F.data.startswith("g:settime:"))
 async def cb_g_settime(call: CallbackQuery):
@@ -522,6 +538,7 @@ async def cb_g_settime(call: CallbackQuery):
     await call.message.edit_text("⏱ Send <b>Time per question</b> in seconds (e.g., 30).")
     await call.answer()
 
+
 @router.callback_query(F.data.startswith("g:setmarks:"))
 async def cb_g_setmarks(call: CallbackQuery):
     gid = call.data.split(":")[-1]
@@ -529,11 +546,13 @@ async def cb_g_setmarks(call: CallbackQuery):
     await call.message.edit_text("🎯 Send marks as: <code>mark_per_q negative</code>\nExample: <code>1 0.25</code>")
     await call.answer()
 
+
 @router.callback_query(F.data.startswith("g:schedule:"))
 async def cb_g_schedule(call: CallbackQuery):
     gid = call.data.split(":")[-1]
     await call.message.edit_text("🗓 Choose schedule:", reply_markup=kb_schedule(gid))
     await call.answer()
+
 
 @router.callback_query(F.data.startswith("sch:"))
 async def cb_schedule(call: CallbackQuery, bot: Bot):
@@ -556,8 +575,12 @@ async def cb_schedule(call: CallbackQuery, bot: Bot):
         await start_exam_in_group(bot, int(gid), initiator_id=call.from_user.id, silent=True)
 
     SCHEDULE_TASKS[(int(gid), key)] = asyncio.create_task(_job())
-    await call.message.edit_text(f"✅ Scheduled for <b>{run_at.strftime('%Y-%m-%d %H:%M')}</b>", reply_markup=kb_group_actions(gid))
+    await call.message.edit_text(
+        f"✅ Scheduled for <b>{run_at.strftime('%Y-%m-%d %H:%M')}</b>",
+        reply_markup=kb_group_actions(gid),
+    )
     await call.answer("Scheduled ✅")
+
 
 @router.callback_query(F.data.startswith("g:start:"))
 async def cb_g_start(call: CallbackQuery, bot: Bot):
@@ -569,7 +592,6 @@ async def cb_g_start(call: CallbackQuery, bot: Bot):
 
 @router.message(F.chat.type == ChatType.PRIVATE, F.text)
 async def dm_wizard_text(message: Message, bot: Bot):
-    # cache last DM content too (text)
     if is_internal_admin(message.from_user.id):
         LAST_DM_CONTENT[message.from_user.id] = (message.chat.id, message.message_id)
 
@@ -583,6 +605,7 @@ async def dm_wizard_text(message: Message, bot: Bot):
 
     try:
         p = get_preset(gid)
+
         if mode == "name":
             p.exam_name = message.text.strip()
             p.ready = False
@@ -626,7 +649,6 @@ async def dm_wizard_text(message: Message, bot: Bot):
 
         WIZARD.pop(message.from_user.id, None)
 
-        # edit same panel message
         try:
             await bot.edit_message_text(
                 chat_id=panel_chat,
@@ -645,7 +667,7 @@ async def dm_wizard_text(message: Message, bot: Bot):
 
 
 # =========================================================
-#  GROUP BIND
+#  GROUP: bind
 # =========================================================
 @router.message(Command("bind_group"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def cmd_bind_group(message: Message, bot: Bot):
@@ -655,15 +677,16 @@ async def cmd_bind_group(message: Message, bot: Bot):
 
     groups = load_groups()
     gid = str(message.chat.id)
+    chat = await bot.get_chat(message.chat.id)
+
     groups[gid] = {
         "title": message.chat.title or gid,
         "type": message.chat.type,
         "bound_at": datetime.utcnow().isoformat(),
-        "public_username": (await bot.get_chat(message.chat.id)).username,
+        "public_username": getattr(chat, "username", None),
     }
     save_groups(groups)
 
-    # ensure preset exists
     p = get_preset(gid)
     save_preset(gid, p)
 
@@ -704,12 +727,6 @@ async def dm_quiz_poll(message: Message):
 #  QUESTIONS: JSON import + validator
 # =========================================================
 def validate_json_questions(obj: Any) -> Tuple[bool, str, List[Question]]:
-    """
-    Expected:
-    [
-      {"question":"...", "options":{"A":"..","B":"..","C":"..","D":".."}, "correct_answer":"A", ...}
-    ]
-    """
     if not isinstance(obj, list):
         return False, "Root must be a JSON array (list).", []
     out: List[Question] = []
@@ -733,17 +750,19 @@ def validate_json_questions(obj: Any) -> Tuple[bool, str, List[Question]]:
         out.append(Question(text=qtext.strip(), options=options_list, correct_id=correct_id))
     return True, f"✅ Valid JSON. Questions: {len(out)}", out
 
+
 @router.message(Command("json_template"), F.chat.type == ChatType.PRIVATE)
 async def cmd_json_template(message: Message):
     tpl = [
         {
-            "question": "What is the capital of France?",
-            "options": {"A": "Paris", "B": "London", "C": "Rome", "D": "Berlin"},
+            "question": "বাংলাদেশের রাজধানী কোনটি? 🇧🇩",
+            "options": {"A": "ঢাকা", "B": "চট্টগ্রাম", "C": "খুলনা", "D": "রাজশাহী"},
             "correct_answer": "A",
             "explanation": "Optional"
         }
     ]
     await message.answer("<b>JSON Template</b>\n\n<pre>" + json.dumps(tpl, ensure_ascii=False, indent=2) + "</pre>")
+
 
 @router.message(Command("validate_json"), F.chat.type == ChatType.PRIVATE)
 async def cmd_validate_json(message: Message, bot: Bot):
@@ -766,6 +785,7 @@ async def cmd_validate_json(message: Message, bot: Bot):
         return
     ok, msg, _ = validate_json_questions(obj)
     await message.answer(msg if ok else f"❌ {msg}")
+
 
 @router.message(F.chat.type == ChatType.PRIVATE, F.document)
 async def dm_json_import(message: Message, bot: Bot):
@@ -796,13 +816,12 @@ async def dm_json_import(message: Message, bot: Bot):
 # =========================================================
 @router.message(F.chat.type == ChatType.PRIVATE)
 async def cache_any_dm_content(message: Message):
-    # Cache last DM content for internal admins only (any type)
     if not is_internal_admin(message.from_user.id):
         return
-    # Ignore commands; content only
     if message.text and message.text.startswith("/"):
         return
     LAST_DM_CONTENT[message.from_user.id] = (message.chat.id, message.message_id)
+
 
 @router.message(Command("announce"), F.chat.type == ChatType.PRIVATE)
 async def cmd_announce(message: Message):
@@ -810,7 +829,6 @@ async def cmd_announce(message: Message):
         await message.answer(unauthorized_text())
         return
 
-    # Prefer reply draft; else last DM content
     if message.reply_to_message:
         ANNOUNCE_DRAFT[message.from_user.id] = (message.reply_to_message.chat.id, message.reply_to_message.message_id)
     else:
@@ -826,6 +844,7 @@ async def cmd_announce(message: Message):
         return
 
     await message.answer("📣 Select a group:", reply_markup=kb_groups(0, prefix="ann"))
+
 
 @router.message(Command("announce_pin"), F.chat.type == ChatType.PRIVATE)
 async def cmd_announce_pin(message: Message):
@@ -849,17 +868,20 @@ async def cmd_announce_pin(message: Message):
 
     await message.answer("📌 Select a group to post & pin:", reply_markup=kb_groups(0, prefix="annpin"))
 
+
 @router.callback_query(F.data.startswith("ann:page:"))
 async def cb_ann_page(call: CallbackQuery):
     page = int(call.data.split(":")[-1])
     await call.message.edit_reply_markup(reply_markup=kb_groups(page, prefix="ann"))
     await call.answer()
 
+
 @router.callback_query(F.data.startswith("annpin:page:"))
 async def cb_annpin_page(call: CallbackQuery):
     page = int(call.data.split(":")[-1])
     await call.message.edit_reply_markup(reply_markup=kb_groups(page, prefix="annpin"))
     await call.answer()
+
 
 @router.callback_query(F.data == "ann:close")
 async def cb_ann_close(call: CallbackQuery):
@@ -869,6 +891,7 @@ async def cb_ann_close(call: CallbackQuery):
         pass
     await call.answer()
 
+
 @router.callback_query(F.data == "annpin:close")
 async def cb_annpin_close(call: CallbackQuery):
     try:
@@ -876,6 +899,7 @@ async def cb_annpin_close(call: CallbackQuery):
     except Exception:
         pass
     await call.answer()
+
 
 @router.callback_query(F.data.startswith("ann:pick:"))
 async def cb_ann_pick(call: CallbackQuery, bot: Bot):
@@ -895,6 +919,7 @@ async def cb_ann_pick(call: CallbackQuery, bot: Bot):
         await call.message.edit_text(f"❌ Failed: {e}")
     await call.answer()
 
+
 @router.callback_query(F.data.startswith("annpin:pick:"))
 async def cb_annpin_pick(call: CallbackQuery, bot: Bot):
     if not is_internal_admin(call.from_user.id):
@@ -909,7 +934,7 @@ async def cb_annpin_pick(call: CallbackQuery, bot: Bot):
     try:
         sent = await bot.copy_message(chat_id=gid, from_chat_id=src_chat, message_id=src_msg)
         try:
-            await bot.pin_chat_message(chat_id=gid, message_id=sent.message_id)
+            await bot.pin_chat_message(chat_id=gid, message_id=sent.message_id, disable_notification=True)
         except Exception:
             pass
         await call.message.edit_text("✅ Posted (pin attempted).")
@@ -919,9 +944,8 @@ async def cb_annpin_pick(call: CallbackQuery, bot: Bot):
 
 
 # =========================================================
-#  GROUP: pin service cleanup (delete 'pinned a message' service message)
+#  GROUP: delete pin service message (pinned a message)
 # =========================================================
-
 @router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.pinned_message)
 async def cleanup_pin_service(message: Message):
     session = EXAMS.get(message.chat.id)
@@ -935,7 +959,7 @@ async def cleanup_pin_service(message: Message):
 
 
 # =========================================================
-#  GROUP: command lock for non-admin users
+#  GROUP: exam lock (delete all non-admin messages during exam)
 # =========================================================
 @router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def group_lock(message: Message, bot: Bot):
@@ -944,17 +968,12 @@ async def group_lock(message: Message, bot: Bot):
         return
     if not message.from_user:
         return
-
     if is_internal_admin(message.from_user.id):
         return
-
-    # Delete everything
     try:
         await message.delete()
     except Exception:
         pass
-
-    # Warning DM
     try:
         await bot.send_message(message.from_user.id, unauthorized_text())
     except Exception:
@@ -962,7 +981,7 @@ async def group_lock(message: Message, bot: Bot):
 
 
 # =========================================================
-#  GROUP: start/stop exam (Owner/Admin only)
+#  EXAM start/stop
 # =========================================================
 async def start_exam_in_group(bot: Bot, chat_id: int, initiator_id: int, silent: bool) -> Tuple[bool, str]:
     if not QUESTION_BANK:
@@ -988,58 +1007,48 @@ async def start_exam_in_group(bot: Bot, chat_id: int, initiator_id: int, silent:
     EXAMS[chat_id] = session
 
     async def _start_sequence():
-        # Intro message (will be pinned) + 5s countdown (edits same message)
+        total_q = len(session.questions)
+        intro_text = (
+            f"📝 <b>{session.exam_name}</b>\n"
+            f"• Questions: <b>{total_q}</b>\n"
+            f"• Time/Q: <b>{session.time_per_q}s</b>\n"
+            f"• Mark: <b>+{session.mark_per_q}</b>\n"
+            f"• Negative: <b>-{session.negative}</b>\n\n"
+            f"⏳ Starting in <b>{{sec}}</b> seconds..."
+        )
         try:
-            intro = await bot.send_message(
-                chat_id,
-                f"📝 <b>{session.exam_name}</b>"
-                f"Questions: <b>{len(session.questions)}</b> | Time/Q: <b>{session.time_per_q}s</b> | "
-                f"Mark: <b>+{session.mark_per_q}</b> | Negative: <b>-{session.negative}</b>"
-                f"⏳ Starting in <b>5</b> seconds..."
-            )
+            intro = await bot.send_message(chat_id, intro_text.format(sec=5))
             session.intro_message_id = intro.message_id
 
-            for i in range(4, 0, -1):
+            for sec in range(4, 0, -1):
                 await asyncio.sleep(1)
                 try:
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=intro.message_id,
-                        text=(
-                            f"📝 <b>{session.exam_name}</b>"
-                            f"Questions: <b>{len(session.questions)}</b> | Time/Q: <b>{session.time_per_q}s</b> | "
-                            f"Mark: <b>+{session.mark_per_q}</b> | Negative: <b>-{session.negative}</b>"
-                            f"⏳ Starting in <b>{i}</b> seconds..."
-                        ),
-                    )
+                    await bot.edit_message_text(chat_id=chat_id, message_id=intro.message_id, text=intro_text.format(sec=sec))
                 except Exception:
                     pass
 
-            # Pin intro message, then delete the service 'pinned a message'
+            # Pin intro message
             try:
                 session.pin_cleanup_until = datetime.utcnow() + timedelta(seconds=15)
                 await bot.pin_chat_message(chat_id=chat_id, message_id=intro.message_id, disable_notification=True)
             except Exception:
                 pass
 
-            # Start questions
             await asyncio.sleep(1)
         except Exception:
             pass
 
         asyncio.create_task(run_exam(bot, session))
 
-    # If silent schedule start: still run sequence but no extra spam beyond pinned intro
     asyncio.create_task(_start_sequence())
     return True, "✅ Exam started."
+
 
 @router.message(Command("start_exam"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def cmd_start_exam(message: Message, bot: Bot, command: CommandObject):
     if not is_internal_admin(message.from_user.id):
         await deny_and_warn(message, bot, delete_in_group=True)
         return
-
-    # Delete command message for clean group
     try:
         await message.delete()
     except Exception:
@@ -1053,7 +1062,7 @@ async def cmd_start_exam(message: Message, bot: Bot, command: CommandObject):
         if rest.startswith('"') and '"' in rest[1:]:
             end = rest[1:].index('"') + 1
             name = rest[1:end]
-            rest = rest[end+1:].strip()
+            rest = rest[end + 1 :].strip()
         parts = rest.split()
         try:
             t = int(parts[0]) if len(parts) >= 1 else DEFAULT_TIME_PER_Q
@@ -1077,12 +1086,12 @@ async def cmd_start_exam(message: Message, bot: Bot, command: CommandObject):
     if not ok:
         await bot.send_message(message.from_user.id, "❌ Failed to start exam. Make sure preset is READY and questions exist.")
 
+
 @router.message(Command("stop_exam"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def cmd_stop_exam(message: Message, bot: Bot):
     if not is_internal_admin(message.from_user.id):
         await deny_and_warn(message, bot, delete_in_group=True)
         return
-
     try:
         await message.delete()
     except Exception:
@@ -1166,7 +1175,6 @@ async def run_exam(bot: Bot, session: ExamSession):
             session.poll_id_to_q_idx[msg.poll.id] = idx
             session.posted_message_ids[idx] = msg.message_id
             session.answered_users_per_q.setdefault(idx, set())
-
         except Exception as e:
             logging.exception("send_poll failed: %s", e)
             session.active = False
@@ -1179,7 +1187,7 @@ async def run_exam(bot: Bot, session: ExamSession):
 
 
 # =========================================================
-#  Leaderboard Image
+#  Fonts + mixed rendering (Image)
 # =========================================================
 def _pick_font_path(candidates: List[str]) -> Optional[str]:
     for p in candidates:
@@ -1190,10 +1198,8 @@ def _pick_font_path(candidates: List[str]) -> Optional[str]:
             continue
     return None
 
+
 def _load_font(size: int, kind: str = "latin") -> ImageFont.FreeTypeFont:
-    """
-    kind: latin | bengali | emoji
-    """
     if kind == "bengali":
         path = _pick_font_path(BENGALI_FONT_FILES) or _pick_font_path(LATIN_FONT_FILES)
     elif kind == "emoji":
@@ -1208,16 +1214,19 @@ def _load_font(size: int, kind: str = "latin") -> ImageFont.FreeTypeFont:
             pass
     return ImageFont.load_default()
 
+
 def _is_emoji(ch: str) -> bool:
     o = ord(ch)
     return (
-        0x1F300 <= o <= 0x1FAFF  # emojis
-        or 0x2600 <= o <= 0x27BF  # misc symbols
-        or 0xFE00 <= o <= 0xFE0F  # variation selectors
-        or 0x1F1E6 <= o <= 0x1F1FF  # flags
+        0x1F300 <= o <= 0x1FAFF
+        or 0x2600 <= o <= 0x27BF
+        or 0xFE00 <= o <= 0xFE0F
+        or 0x1F1E6 <= o <= 0x1F1FF
     )
 
-def draw_text_mixed(draw: ImageDraw.ImageDraw, xy: Tuple[int, int], text: str, font_text: ImageFont.FreeTypeFont, font_emoji: ImageFont.FreeTypeFont, fill) -> None:
+
+def draw_text_mixed(draw: ImageDraw.ImageDraw, xy: Tuple[int, int], text: str,
+                    font_text: ImageFont.FreeTypeFont, font_emoji: ImageFont.FreeTypeFont, fill) -> None:
     x, y = xy
     for ch in text:
         font = font_emoji if _is_emoji(ch) else font_text
@@ -1228,8 +1237,8 @@ def draw_text_mixed(draw: ImageDraw.ImageDraw, xy: Tuple[int, int], text: str, f
             w = font.getlength(ch) if hasattr(font, "getlength") else font.getsize(ch)[0]
         x += int(w)
 
+
 def generate_leaderboard_image(exam_name: str, rows: List[Tuple[int, str, float, int, int, int]], out_path: str) -> None:
-    # dark + glow
     W, H = 1080, 1350
     bg = Image.new("RGB", (W, H), (10, 12, 18))
     draw = ImageDraw.Draw(bg)
@@ -1237,11 +1246,11 @@ def generate_leaderboard_image(exam_name: str, rows: List[Tuple[int, str, float,
     title_font = _load_font(54, "bengali")
     sub_font = _load_font(28, "latin")
     row_font = _load_font(34, "bengali")
+
     emoji_title = _load_font(54, "emoji")
     emoji_row = _load_font(34, "emoji")
     emoji_sub = _load_font(28, "emoji")
 
-    # glow title
     title = f"LEADERBOARD — {exam_name}"
     tx, ty = 60, 50
 
@@ -1255,7 +1264,6 @@ def generate_leaderboard_image(exam_name: str, rows: List[Tuple[int, str, float,
 
     draw_text_mixed(draw, (60, 120), "Top performers (score includes negative marking)", sub_font, emoji_sub, (170, 180, 200))
 
-    # table header
     y = 190
     draw.rounded_rectangle((50, y, W - 50, y + 70), radius=18, fill=(18, 22, 32))
     draw_text_mixed(draw, (70, y + 18), "Rank", sub_font, emoji_sub, (220, 225, 240))
@@ -1265,9 +1273,7 @@ def generate_leaderboard_image(exam_name: str, rows: List[Tuple[int, str, float,
     y += 90
     card_h = 90
     for rank, name, score, c, w, s in rows:
-        # card
         draw.rounded_rectangle((50, y, W - 50, y + card_h), radius=18, fill=(14, 18, 28))
-        # subtle glow for top 3
         if rank <= 3:
             g = Image.new("RGBA", (W, H), (0, 0, 0, 0))
             gd = ImageDraw.Draw(g)
@@ -1277,14 +1283,13 @@ def generate_leaderboard_image(exam_name: str, rows: List[Tuple[int, str, float,
             draw = ImageDraw.Draw(bg)
 
         draw_text_mixed(draw, (75, y + 25), f"{rank}", row_font, emoji_row, (230, 235, 250))
-        # trim name
+
         n = name
         if len(n) > 28:
             n = n[:27] + "…"
         draw_text_mixed(draw, (210, y + 25), n, row_font, emoji_row, (230, 235, 250))
-        draw.text((840, y + 25), f"{score:.2f}", font=row_font, fill=(210, 255, 220))
 
-        # small stats
+        draw.text((840, y + 25), f"{score:.2f}", font=row_font, fill=(210, 255, 220))
         draw.text((210, y + 60), f"C:{c}  W:{w}  S:{s}", font=_load_font(22, "latin"), fill=(150, 160, 185))
 
         y += card_h + 18
@@ -1296,12 +1301,9 @@ def generate_leaderboard_image(exam_name: str, rows: List[Tuple[int, str, float,
 
 
 # =========================================================
-#  PDF Report
+#  PDF (Bangla/Emoji best effort + nicer design)
 # =========================================================
 def _register_pdf_fonts() -> Tuple[str, str]:
-    """
-    Returns (text_font_name, emoji_font_name). Falls back to Helvetica if no TTF found.
-    """
     text_font_name = "Helvetica"
     emoji_font_name = "Helvetica"
 
@@ -1314,7 +1316,6 @@ def _register_pdf_fonts() -> Tuple[str, str]:
             pass
 
     em_path = _pick_font_path(EMOJI_FONT_FILES)
-    # NotoEmoji-Regular.ttf is monochrome; Segoe UI Emoji also works for many glyphs
     if em_path:
         try:
             pdfmetrics.registerFont(TTFont("EMOJI", em_path))
@@ -1324,88 +1325,88 @@ def _register_pdf_fonts() -> Tuple[str, str]:
 
     return text_font_name, emoji_font_name
 
-def _pdf_is_emoji(ch: str) -> bool:
-    return _is_emoji(ch)
 
-def pdf_draw_mixed(c: canvas.Canvas, x: float, y: float, text: str, font_text: str, font_emoji: str, size: int, color=colors.black) -> None:
+def pdf_draw_mixed(c: canvas.Canvas, x: float, y: float, text: str,
+                   font_text: str, font_emoji: str, size: int, color=colors.black) -> None:
     c.setFillColor(color)
     cx = x
     for ch in text:
-        fn = font_emoji if _pdf_is_emoji(ch) else font_text
+        fn = font_emoji if _is_emoji(ch) else font_text
         try:
             c.setFont(fn, size)
+            c.drawString(cx, y, ch)
+            # accurate width if possible
+            try:
+                w = pdfmetrics.stringWidth(ch, fn, size)
+            except Exception:
+                w = size * 0.55
         except Exception:
             c.setFont("Helvetica", size)
-        c.drawString(cx, y, ch)
-        # crude advance; works well enough for reports
-        cx += (size * 0.55) if _pdf_is_emoji(ch) else (size * 0.52)
+            c.drawString(cx, y, ch)
+            w = size * 0.55
+        cx += w
 
-def generate_pdf_report(exam_name: str, results: List[UserResult], total_q: int, mark_per_q: float, negative: float, out_path: str) -> None:
-    """
-    Designed PDF with Bangla + emoji best-effort via embedded TTF fonts.
-    Put fonts into ./fonts for full unicode rendering.
-    """
+
+def generate_pdf_report(exam_name: str, results: List[UserResult], total_q: int,
+                        mark_per_q: float, negative: float, out_path: str) -> None:
     font_text, font_emoji = _register_pdf_fonts()
 
     c = canvas.Canvas(out_path, pagesize=A4)
     w, h = A4
     margin = 1.6 * cm
 
-    # Background header block
+    # Header
     c.setFillColor(colors.HexColor("#0B1020"))
-    c.rect(0, h - 4.2*cm, w, 4.2*cm, stroke=0, fill=1)
+    c.rect(0, h - 4.2 * cm, w, 4.2 * cm, stroke=0, fill=1)
+    pdf_draw_mixed(c, margin, h - 2.2 * cm, f"Exam Report — {exam_name}", font_text, font_emoji, 18, color=colors.white)
 
-    # Title
-    pdf_draw_mixed(c, margin, h - 2.2*cm, f"Exam Report — {exam_name}", font_text, font_emoji, 18, color=colors.white)
-
-    c.setFillColor(colors.HexColor("#C7D2FE"))
     c.setStrokeColor(colors.HexColor("#22305A"))
     c.setLineWidth(1)
-    c.roundRect(margin, h - 3.5*cm, w - 2*margin, 1.0*cm, 10, stroke=1, fill=0)
+    c.roundRect(margin, h - 3.5 * cm, w - 2 * margin, 1.0 * cm, 10, stroke=1, fill=0)
 
-    info = f"Total Questions: {total_q}   |   Mark/Q: +{mark_per_q}   |   Negative: -{negative}   |   Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    pdf_draw_mixed(c, margin + 0.4*cm, h - 3.15*cm, info, font_text, font_emoji, 10, color=colors.HexColor("#C7D2FE"))
+    info = (
+        f"Total Questions: {total_q}   |   Mark/Q: +{mark_per_q}   |   Negative: -{negative}   |   "
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+    pdf_draw_mixed(c, margin + 0.4 * cm, h - 3.15 * cm, info, font_text, font_emoji, 10, color=colors.HexColor("#C7D2FE"))
 
-    # Leaderboard table container
-    table_top = h - 5.0*cm
+    # Table container
+    table_top = h - 5.0 * cm
     c.setFillColor(colors.HexColor("#F8FAFC"))
-    c.roundRect(margin, 1.6*cm, w - 2*margin, table_top - 1.6*cm, 12, stroke=0, fill=1)
+    c.roundRect(margin, 1.6 * cm, w - 2 * margin, table_top - 1.6 * cm, 12, stroke=0, fill=1)
 
-    # Table header row
-    header_h = 0.9*cm
+    # Header row
+    header_h = 0.9 * cm
     c.setFillColor(colors.HexColor("#111827"))
-    c.roundRect(margin, table_top - header_h, w - 2*margin, header_h, 12, stroke=0, fill=1)
+    c.roundRect(margin, table_top - header_h, w - 2 * margin, header_h, 12, stroke=0, fill=1)
 
-    cols = [margin + 0.4*cm, margin + 2.0*cm, margin + 12.2*cm, margin + 14.4*cm, margin + 16.0*cm, margin + 17.6*cm]
+    cols = [margin + 0.4 * cm, margin + 2.0 * cm, margin + 12.2 * cm, margin + 14.4 * cm, margin + 16.0 * cm, margin + 17.6 * cm]
     headers = ["#", "Name", "Score", "C", "W", "S"]
     for i, head in enumerate(headers):
-        pdf_draw_mixed(c, cols[i], table_top - 0.62*cm, head, font_text, font_emoji, 10, color=colors.white)
+        pdf_draw_mixed(c, cols[i], table_top - 0.62 * cm, head, font_text, font_emoji, 10, color=colors.white)
 
-    # Rows
-    y = table_top - header_h - 0.55*cm
-    row_h = 0.62*cm
+    y = table_top - header_h - 0.55 * cm
+    row_h = 0.62 * cm
 
-    c.setFillColor(colors.HexColor("#0F172A"))
     for rank, r in enumerate(results, start=1):
-        if y < 2.3*cm:
+        if y < 2.3 * cm:
             c.showPage()
-            # Re-draw minimal header on new page
             c.setFillColor(colors.HexColor("#0B1020"))
-            c.rect(0, h - 2.3*cm, w, 2.3*cm, stroke=0, fill=1)
-            pdf_draw_mixed(c, margin, h - 1.5*cm, f"Exam Report — {exam_name} (cont.)", font_text, font_emoji, 14, color=colors.white)
-            table_top = h - 3.0*cm
-            c.setFillColor(colors.HexColor("#F8FAFC"))
-            c.roundRect(margin, 1.6*cm, w - 2*margin, table_top - 1.6*cm, 12, stroke=0, fill=1)
-            c.setFillColor(colors.HexColor("#111827"))
-            c.roundRect(margin, table_top - header_h, w - 2*margin, header_h, 12, stroke=0, fill=1)
-            for i, head in enumerate(headers):
-                pdf_draw_mixed(c, cols[i], table_top - 0.62*cm, head, font_text, font_emoji, 10, color=colors.white)
-            y = table_top - header_h - 0.55*cm
+            c.rect(0, h - 2.3 * cm, w, 2.3 * cm, stroke=0, fill=1)
+            pdf_draw_mixed(c, margin, h - 1.5 * cm, f"Exam Report — {exam_name} (cont.)", font_text, font_emoji, 14, color=colors.white)
 
-        # zebra rows
+            table_top = h - 3.0 * cm
+            c.setFillColor(colors.HexColor("#F8FAFC"))
+            c.roundRect(margin, 1.6 * cm, w - 2 * margin, table_top - 1.6 * cm, 12, stroke=0, fill=1)
+            c.setFillColor(colors.HexColor("#111827"))
+            c.roundRect(margin, table_top - header_h, w - 2 * margin, header_h, 12, stroke=0, fill=1)
+            for i, head in enumerate(headers):
+                pdf_draw_mixed(c, cols[i], table_top - 0.62 * cm, head, font_text, font_emoji, 10, color=colors.white)
+            y = table_top - header_h - 0.55 * cm
+
         if rank % 2 == 0:
             c.setFillColor(colors.HexColor("#EEF2FF"))
-            c.roundRect(margin + 0.15*cm, y - 0.1*cm, w - 2*margin - 0.3*cm, row_h + 0.25*cm, 8, stroke=0, fill=1)
+            c.roundRect(margin + 0.15 * cm, y - 0.1 * cm, w - 2 * margin - 0.3 * cm, row_h + 0.25 * cm, 8, stroke=0, fill=1)
 
         name = r.full_name + (f" (@{r.username})" if r.username else "")
         if len(name) > 60:
@@ -1424,7 +1425,7 @@ def generate_pdf_report(exam_name: str, results: List[UserResult], total_q: int,
 
 
 # =========================================================
-#  Finish exam: image + DM analysis + PDF to owner/admins
+#  Finish exam: image + DM analysis + PDF
 # =========================================================
 def motivational_speech() -> str:
     return (
@@ -1433,6 +1434,7 @@ def motivational_speech() -> str:
         "Focus, practice, and improve—your next attempt will be better."
     )
 
+
 async def finish_exam(bot: Bot, session: ExamSession, stopped: bool):
     if session.finished:
         return
@@ -1440,7 +1442,6 @@ async def finish_exam(bot: Bot, session: ExamSession, stopped: bool):
 
     total_q = len(session.questions)
 
-    # fill skipped & ensure answers map complete
     for r in session.results.values():
         answered = r.correct + r.wrong
         r.skipped = total_q - answered
@@ -1448,48 +1449,40 @@ async def finish_exam(bot: Bot, session: ExamSession, stopped: bool):
             if qi not in r.answers:
                 r.answers[qi] = "S"
 
-    # sort with negative included (score already includes negative)
     sorted_results = sorted(session.results.values(), key=lambda x: (-x.score, -x.correct))
 
-    # Build leaderboard rows (top 10 or fewer)
     top_n = min(10, len(sorted_results))
     rows = []
     for i in range(top_n):
         r = sorted_results[i]
         name = r.full_name + (f" (@{r.username})" if r.username else "")
-        rows.append((i+1, name, r.score, r.correct, r.wrong, r.skipped))
+        rows.append((i + 1, name, r.score, r.correct, r.wrong, r.skipped))
 
-    # Generate leaderboard image (even if 0 users, show empty image)
     img_path = os.path.join(DATA_DIR, f"leaderboard_{session.chat_id}.png")
     if rows:
         generate_leaderboard_image(session.exam_name, rows, img_path)
     else:
         generate_leaderboard_image(session.exam_name, [(1, "No participants", 0.0, 0, 0, total_q)], img_path)
 
-    # Send image to group (ONLY image)
+    # Group: only image
     try:
         from aiogram.types import FSInputFile
         await bot.send_photo(session.chat_id, FSInputFile(img_path), caption=f"🏆 {session.exam_name} — Top {top_n if rows else 0}")
     except Exception:
         pass
 
-    # DM per-user analysis
+    # DM analysis
     groups = load_groups()
     meta = groups.get(str(session.chat_id), {})
     public_username = meta.get("public_username")
 
     for rank, r in enumerate(sorted_results, start=1):
-        # Build serial lists with links
-        right_links = []
-        wrong_links = []
-        skip_links = []
+        right_links, wrong_links, skip_links = [], [], []
 
         for qi in range(total_q):
             status = r.answers.get(qi, "S")
             msg_id = session.posted_message_ids.get(qi)
-            link = ""
-            if msg_id:
-                link = make_message_link(session.chat_id, msg_id, public_username)
+            link = make_message_link(session.chat_id, msg_id, public_username) if msg_id else ""
             item = f"{qi+1}" + (f" — {link}" if link else "")
             if status == "C":
                 right_links.append(item)
@@ -1516,10 +1509,9 @@ async def finish_exam(bot: Bot, session: ExamSession, stopped: bool):
         try:
             await bot.send_message(r.user_id, dm, disable_web_page_preview=True)
         except Exception:
-            # user didn't /start bot, can't DM
             pass
 
-    # PDF to owner + internal admins
+    # PDF to owner/admins
     pdf_path = os.path.join(DATA_DIR, f"report_{session.chat_id}.pdf")
     generate_pdf_report(session.exam_name, sorted_results, total_q, session.mark_per_q, session.negative, pdf_path)
 
@@ -1531,25 +1523,22 @@ async def finish_exam(bot: Bot, session: ExamSession, stopped: bool):
         except Exception:
             pass
 
-    # Auto clear data after finish (as requested)
+    # Auto clear after finish (your rule)
     EXAMS.pop(session.chat_id, None)
     QUESTION_BANK.clear()
     save_questions(QUESTION_BANK)
 
-    # preset becomes NOT READY
     gid = str(session.chat_id)
     p = get_preset(gid)
     p.ready = False
     save_preset(gid, p)
-
-    # No noisy group messages for stop/finish (you requested)
 
 
 # =========================================================
 #  Diagnostics (DM)
 # =========================================================
 @router.message(Command("diagnose"), F.chat.type == ChatType.PRIVATE)
-async def cmd_diagnose(message: Message, bot: Bot):
+async def cmd_diagnose(message: Message):
     if not is_internal_admin(message.from_user.id):
         await message.answer(unauthorized_text())
         return
@@ -1564,7 +1553,8 @@ async def cmd_diagnose(message: Message, bot: Bot):
         f"Questions: <b>{len(QUESTION_BANK)}</b>\n"
         f"Active Exams: <b>{sum(1 for s in EXAMS.values() if s.active)}</b>\n\n"
         f"<b>Announcement</b>: send content → /announce → pick group\n"
-        f"<b>Exam</b>: setup preset READY in /admin_panel → group /start_exam\n"
+        f"<b>Exam</b>: /admin_panel → Groups → Setup → READY → group /start_exam\n"
+        f"<b>Fonts</b>: put Bangla/Emoji TTF into <code>./fonts</code>\n"
     )
     await message.answer(txt)
 
@@ -1575,8 +1565,8 @@ async def cmd_diagnose(message: Message, bot: Bot):
 async def main():
     logging.basicConfig(level=logging.INFO)
 
-    if not BOT_TOKEN or "PASTE_YOUR_BOT_TOKEN_HERE" in BOT_TOKEN:
-        raise RuntimeError("Set BOT_TOKEN at top of the file (hardcoded).")
+    if not BOT_TOKEN or BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE":
+        raise RuntimeError("Set BOT_TOKEN at top of file (hardcoded).")
 
     bot = Bot(
         token=BOT_TOKEN,
@@ -1586,7 +1576,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    logging.info("Extreme Exam Bot (code-fixed) starting...")
+    logging.info("Extreme Exam Bot starting...")
     await dp.start_polling(bot)
 
 
