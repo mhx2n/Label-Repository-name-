@@ -1,390 +1,1171 @@
-#leteste_varsion_date_15/12/25
-import logging, os, asyncio, re
-from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+import asyncio
+import json
+import logging
+import os
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Set, Any, Tuple
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ChatType
+from aiogram.filters import Command, CommandObject
+from aiogram.types import (
+    Message, PollAnswer,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    CallbackQuery, FSInputFile
+)
 
-# ----------------- CONFIG -----------------
-ADMINS = set([8389621809])   # শুরুতে owner এর user_id বসাও
-CHANNELS = {}               # {channel_id: channel_name}
-QUESTION_PREFIX = "[✨𝙏𝘼𝙍𝙂𝙀𝙏 🎯]"
-AUTO_EXPLANATION_LINK = "@FX_Ur_Target"
-QUIZ_DELIMITER = "n"
+# ===================== CONFIG =====================
 
-OPTION_LABEL_RE = re.compile(r"^\s*(\([a-jA-J]\)|[a-jA-J][\.\)])\s+")
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
 
-def clean_options(options):
-    cleaned = []
-    for opt in options:
-        opt = re.sub(r"^\s*(\([a-dA-D]\)|[a-dA-D][\.\)])\s*", "", opt)
-        cleaned.append(opt.strip())
-    return cleaned
+OWNER_FILE = os.path.join(DATA_DIR, "owner.json")
+GROUPS_FILE = os.path.join(DATA_DIR, "groups.json")
+PRESETS_FILE = os.path.join(DATA_DIR, "presets.json")
+QUESTIONS_FILE = os.path.join(DATA_DIR, "questions.json")
 
-import random
+BOT_TOKEN = "8318888870:AAG_HjP0ucgmq4zDUKsXgEFjj5371LffnZI"  # windows powershell uses $env:BOT_TOKEN
+RIGHT_MARK_DEFAULT = 1.0
+NEGATIVE_DEFAULT = 0.25
+TIME_PER_Q_DEFAULT = 30
 
-def shuffle_options(options, correct_idx):
-    indexed = list(enumerate(options))   # [(0,opt0),(1,opt1)...]
-    random.shuffle(indexed)
+# =================== DATA MODELS ===================
 
-    new_options = []
-    new_correct_idx = 0
-
-    for new_i, (old_i, opt) in enumerate(indexed):
-        new_options.append(opt)
-        if old_i == correct_idx:
-            new_correct_idx = new_i
-
-    return new_options, new_correct_idx
-
-def clean_question(text: str) -> str:
-    text = text.strip()
-
-    # শুরুতে থাকা [ ... ] কাটা
-    text = re.sub(r"^\s*(\[[^\]]*\]\s*)+", "", text)
-
-    # শুরুতে সিরিয়াল নাম্বার কাটা
-    # 17। | 1. | 12: | 78| | 1) | Q12.
-    text = re.sub(r"^\s*(Q?\d+[\.\:\|\)|।-]?\s*)+", "", text)
-
-    # শেষে থাকা [ ... ] কাটা
-    text = re.sub(r"\s*\[[^\]]*\]\s*$", "", text)
-
-    # extra space clean
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-# ----------------- PARSER -----------------
-def parse_quiz_block(block: str):
-    lines = [line.strip() for line in block.split("\n") if line.strip()]
-    question = None
-    options = []
-    explanation_lines = []
-    correct_idx = 0
-
-    for line in lines:
-        # Option detect: (a)/(A) ইত্যাদি
-        if re.match(r"^\(?[a-dA-D]\)?", line):
-            opt_text = re.sub(r"^\(?[a-dA-D]\)?\s*", "", line)
-            if "*" in opt_text:
-                opt_text = opt_text.replace("*", "")
-                correct_idx = len(options)
-            options.append(opt_text.strip())
-        elif line.startswith("ব্যাখ্যা"):
-            explanation_lines.append(line)
-        elif line.lower() == "n":
-            continue
-        else:
-            # প্রথম non-option লাইনকে question ধরো
-            if question is None:
-                question = clean_question(line)
-            else:
-                explanation_lines.append(line)
-
-    if not question or not options:
-        return None  # ❌ কোনো কুইজ পাওয়া যায়নি
-
-    explanation = " ".join(explanation_lines).strip()
-    return question, options, correct_idx, explanation
+@dataclass
+class Question:
+    text: str
+    options: List[str]   # ["a","b","c","d"]
+    correct_id: int      # 0..3
+    # optional: source info
+    source_chat_id: Optional[int] = None
+    source_message_id: Optional[int] = None
 
 
+@dataclass
+class UserResult:
+    user_id: int
+    full_name: str
+    username: Optional[str] = None
+    correct: int = 0
+    wrong: int = 0
+    skipped: int = 0
+    score: float = 0.0
+    answers: Dict[int, str] = field(default_factory=dict)  # q_index -> "C/W/S"
 
 
-def parse_multiple_quizzes(raw_text: str):
-    quiz_blocks = [b.strip() for b in re.split(r"\n\s*n\s*\n",raw_text) if b.strip()]
-    parsed, errors = [], []
-    for i, block in enumerate(quiz_blocks, start=1):
+@dataclass
+class ExamPreset:
+    exam_name: str = "Untitled Exam"
+    time_per_q: int = TIME_PER_Q_DEFAULT
+    mark_per_q: float = RIGHT_MARK_DEFAULT
+    negative_mark: float = NEGATIVE_DEFAULT
+    ready: bool = False
+
+
+@dataclass
+class ExamSession:
+    chat_id: int
+    questions: List[Question]
+    exam_name: str
+    time_per_question: int
+    mark_per_q: float
+    negative_mark: float
+    active: bool = False
+    finished: bool = False
+
+    current_index: int = 0
+    poll_id_to_q_idx: Dict[str, int] = field(default_factory=dict)
+    results: Dict[int, UserResult] = field(default_factory=dict)
+    answered_users_per_q: Dict[int, Set[int]] = field(default_factory=dict)
+
+    admin_id: Optional[int] = None  # who started
+    started_at: Optional[datetime] = None
+
+
+# =================== GLOBAL STATE ===================
+
+router = Router()
+
+EXAMS: Dict[int, ExamSession] = {}                    # chat_id -> session
+SCHEDULE_TASKS: Dict[Tuple[int, str], asyncio.Task] = {}  # (chat_id, key) -> task
+
+# For DM announcement draft: admin_id -> (message_chat_id, message_id)
+ANNOUNCE_DRAFT: Dict[int, Tuple[int, int]] = {}
+# For DM wizard input: user_id -> dict state
+WIZARD_STATE: Dict[int, Dict[str, Any]] = {}
+
+# =================== STORAGE HELPERS ===================
+
+def _load_json(path: str, default):
+    try:
+        if not os.path.exists(path):
+            return default
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def _save_json(path: str, data) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+def get_owner_id() -> int:
+    data = _load_json(OWNER_FILE, {"owner_id": 0})
+    return int(data.get("owner_id", 0) or 0)
+
+def set_owner_id(owner_id: int) -> None:
+    _save_json(OWNER_FILE, {"owner_id": int(owner_id)})
+
+def get_bound_groups() -> Dict[str, Dict[str, Any]]:
+    # {"-100xxx": {"title": "...", "type": "supergroup", "bound_at": "..."}}
+    return _load_json(GROUPS_FILE, {})
+
+def save_bound_groups(groups: Dict[str, Dict[str, Any]]) -> None:
+    _save_json(GROUPS_FILE, groups)
+
+def get_presets() -> Dict[str, Dict[str, Any]]:
+    return _load_json(PRESETS_FILE, {})
+
+def save_presets(presets: Dict[str, Dict[str, Any]]) -> None:
+    _save_json(PRESETS_FILE, presets)
+
+def load_question_bank() -> List[Question]:
+    raw = _load_json(QUESTIONS_FILE, [])
+    out: List[Question] = []
+    for it in raw:
         try:
-            q, opts, idx, exp = parse_quiz_block(block)
-            parsed.append({
-                "question": f"{QUESTION_PREFIX}\n{q}",
-                "options": opts,
-                "correct_option_index": idx,
-                "explanation": f"{exp}\n{AUTO_EXPLANATION_LINK}" if exp else AUTO_EXPLANATION_LINK,
-            })
-        except Exception as e:
-            errors.append(f"কুইজ {i} ত্রুটি: {e}")
-    return parsed, errors
+            out.append(Question(
+                text=str(it["text"]),
+                options=list(it["options"]),
+                correct_id=int(it["correct_id"]),
+                source_chat_id=it.get("source_chat_id"),
+                source_message_id=it.get("source_message_id"),
+            ))
+        except Exception:
+            continue
+    return out
 
-# ----------------- HANDLERS -----------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        return await update.message.reply_text(
-            "❌ This bot is owned by (@Your_Himus). Please request permission from the owner before using it."
+def save_question_bank(qs: List[Question]) -> None:
+    raw = []
+    for q in qs:
+        raw.append({
+            "text": q.text,
+            "options": q.options,
+            "correct_id": q.correct_id,
+            "source_chat_id": q.source_chat_id,
+            "source_message_id": q.source_message_id,
+        })
+    _save_json(QUESTIONS_FILE, raw)
+
+# load once
+QUESTION_BANK: List[Question] = load_question_bank()
+
+# =================== AUTH HELPERS ===================
+
+async def is_owner(user_id: int) -> bool:
+    return user_id == get_owner_id()
+
+async def is_admin_or_owner(bot: Bot, chat_id: int, user_id: int) -> bool:
+    if await is_owner(user_id):
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+def ensure_owner_claim_hint() -> str:
+    return (
+        "⚠️ Owner is not set yet.\n"
+        "Open bot inbox and send: /claim_owner\n"
+    )
+
+# =================== UI HELPERS ===================
+
+def kb_groups(page: int = 0, per_page: int = 6, prefix: str = "grp") -> InlineKeyboardMarkup:
+    groups = get_bound_groups()
+    items = list(groups.items())
+    total = len(items)
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    start = page * per_page
+    part = items[start:start + per_page]
+
+    rows = []
+    for chat_id, meta in part:
+        title = meta.get("title", chat_id)
+        rows.append([InlineKeyboardButton(text=title, callback_data=f"{prefix}:pick:{chat_id}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"{prefix}:page:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"Page {page+1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"{prefix}:page:{page+1}"))
+
+    if nav:
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton(text="Close", callback_data=f"{prefix}:close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_admin_panel(page: int = 0) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="📌 Groups (Start/Setup)", callback_data="panel:groups:0")],
+        [InlineKeyboardButton(text="🧾 Question Count", callback_data="panel:qcount")],
+        [InlineKeyboardButton(text="🧹 Clear Questions", callback_data="panel:qclear")],
+        [InlineKeyboardButton(text="📣 Announcement", callback_data="panel:announce")],
+        [InlineKeyboardButton(text="❌ Close", callback_data="panel:close")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_group_actions(chat_id: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="✅ Mark READY", callback_data=f"gact:ready:{chat_id}")],
+        [InlineKeyboardButton(text="📝 Set Exam Name", callback_data=f"gact:setname:{chat_id}")],
+        [InlineKeyboardButton(text="⏱ Set Time/Question", callback_data=f"gact:settime:{chat_id}")],
+        [InlineKeyboardButton(text="🎯 Set Marks (+/-)", callback_data=f"gact:setmarks:{chat_id}")],
+        [InlineKeyboardButton(text="🗓 Schedule Start", callback_data=f"gact:schedule:{chat_id}")],
+        [InlineKeyboardButton(text="🚀 Start Now", callback_data=f"gact:start:{chat_id}")],
+        [InlineKeyboardButton(text="↩️ Back", callback_data="panel:groups:0")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_schedule(chat_id: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="5 min", callback_data=f"sch:{chat_id}:5"),
+         InlineKeyboardButton(text="10 min", callback_data=f"sch:{chat_id}:10"),
+         InlineKeyboardButton(text="30 min", callback_data=f"sch:{chat_id}:30")],
+        [InlineKeyboardButton(text="1 hour", callback_data=f"sch:{chat_id}:60")],
+        [InlineKeyboardButton(text="Custom (type in DM)", callback_data=f"sch:{chat_id}:custom")],
+        [InlineKeyboardButton(text="↩️ Back", callback_data=f"gact:open:{chat_id}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def preset_for(chat_id: str) -> ExamPreset:
+    presets = get_presets()
+    d = presets.get(chat_id) or {}
+    return ExamPreset(
+        exam_name=d.get("exam_name", "Untitled Exam"),
+        time_per_q=int(d.get("time_per_q", TIME_PER_Q_DEFAULT)),
+        mark_per_q=float(d.get("mark_per_q", RIGHT_MARK_DEFAULT)),
+        negative_mark=float(d.get("negative_mark", NEGATIVE_DEFAULT)),
+        ready=bool(d.get("ready", False)),
+    )
+
+def save_preset(chat_id: str, preset: ExamPreset) -> None:
+    presets = get_presets()
+    presets[chat_id] = {
+        "exam_name": preset.exam_name,
+        "time_per_q": preset.time_per_q,
+        "mark_per_q": preset.mark_per_q,
+        "negative_mark": preset.negative_mark,
+        "ready": preset.ready,
+    }
+    save_presets(presets)
+
+def format_preset(chat_id: str) -> str:
+    p = preset_for(chat_id)
+    return (
+        f"📌 Group: `{chat_id}`\n"
+        f"🧪 Exam Name: {p.exam_name}\n"
+        f"⏱ Time/Question: {p.time_per_q}s\n"
+        f"✅ Mark/Question: +{p.mark_per_q}\n"
+        f"❌ Negative: -{p.negative_mark}\n"
+        f"🚦 READY: {'YES' if p.ready else 'NO'}\n"
+        f"📚 Questions: {len(QUESTION_BANK)}"
+    )
+
+# ===================== BASIC COMMANDS =====================
+
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    txt = (
+        "👋 Advanced Exam Bot (aiogram v3)\n\n"
+        "First time setup:\n"
+        "1) DM me: /claim_owner\n"
+        "2) In your group: /bind_group\n"
+        "3) DM: send quiz polls or JSON file to add questions\n"
+        "4) DM: /admin_panel → setup group preset → READY\n"
+        "5) Group: /start_exam\n\n"
+        "DM Commands:\n"
+        "• /admin_panel\n"
+        "• /question_count\n"
+        "• /json_template\n"
+        "• /validate_json (reply to a JSON file)\n\n"
+        "Group Commands (owner/admin only):\n"
+        "• /bind_group\n"
+        "• /start_exam\n"
+        "• /stop_exam\n"
+    )
+    await message.answer(txt)
+
+@router.message(Command("whoami"))
+async def cmd_whoami(message: Message):
+    u = message.from_user
+    if not u:
+        return
+    await message.answer(f"Your ID: `{u.id}`", parse_mode="Markdown")
+
+@router.message(Command("claim_owner"), F.chat.type == ChatType.PRIVATE)
+async def cmd_claim_owner(message: Message):
+    u = message.from_user
+    if not u:
+        return
+    current = get_owner_id()
+    if current and current != u.id:
+        await message.answer("❌ Owner already set. Only current owner can change it.")
+        return
+    set_owner_id(u.id)
+    await message.answer("✅ You are now set as OWNER.\nOpen /admin_panel to manage everything.")
+
+@router.message(Command("admin_panel"), F.chat.type == ChatType.PRIVATE)
+async def cmd_admin_panel(message: Message):
+    u = message.from_user
+    if not u:
+        return
+    if get_owner_id() == 0:
+        await message.answer(ensure_owner_claim_hint())
+        return
+    # allow owner + admins of any bound group (practically owner only needed)
+    # we allow only owner for panel to keep simple
+    if not await is_owner(u.id):
+        await message.answer("❌ Only OWNER can use Admin Panel.")
+        return
+
+    await message.answer("⚙️ Admin Panel", reply_markup=kb_admin_panel())
+
+@router.message(Command("question_count"))
+async def cmd_question_count(message: Message):
+    await message.answer(f"📚 Saved Questions: {len(QUESTION_BANK)}")
+
+@router.message(Command("clear_questions"), F.chat.type == ChatType.PRIVATE)
+async def cmd_clear_questions(message: Message):
+    u = message.from_user
+    if not u or not await is_owner(u.id):
+        await message.answer("❌ Only OWNER can clear questions.")
+        return
+    QUESTION_BANK.clear()
+    save_question_bank(QUESTION_BANK)
+    await message.answer("🧹 Question bank cleared.")
+
+# ===================== GROUP BIND =====================
+
+@router.message(Command("bind_group"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def cmd_bind_group(message: Message, bot: Bot):
+    u = message.from_user
+    if not u:
+        return
+
+    # must be owner/admin of the group
+    if not await is_admin_or_owner(bot, message.chat.id, u.id):
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await bot.send_message(
+            u.id,
+            "⚠️ You are not allowed to use this command.\nContact: @Your_Himus / @Probaho_Robot"
         )
+        return
 
-    # Admins get a professional welcome
-    welcome_text = (
-        "✨ Welcome to <b>Ultron Advanced Quiz Bot</b> ✨\n\n"
-        "This bot is designed to help you manage quizzes across multiple channels with ease.\n"
-        "You can add admins, configure channels, customize prefixes, and automate quiz creation.\n\n"
-        "👉 To explore all available commands and features, simply type <b>/help</b>.\n\n"
-        "Let's make your academic and community quizzes more professional, engaging, and error‑free 🚀"
+    groups = get_bound_groups()
+    cid = str(message.chat.id)
+    groups[cid] = {
+        "title": message.chat.title or cid,
+        "type": message.chat.type,
+        "bound_at": datetime.utcnow().isoformat()
+    }
+    save_bound_groups(groups)
+
+    # ensure preset exists
+    p = preset_for(cid)
+    save_preset(cid, p)
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await bot.send_message(u.id, f"✅ Group bound: {message.chat.title}\nNow open /admin_panel → Groups → Setup → READY")
+
+# ===================== QUESTIONS: QUIZ POLL (DM) =====================
+
+@router.message(F.poll, F.chat.type == ChatType.PRIVATE)
+async def handle_quiz_poll_in_dm(message: Message):
+    u = message.from_user
+    if not u:
+        return
+    if get_owner_id() == 0:
+        await message.answer(ensure_owner_claim_hint())
+        return
+    if not await is_owner(u.id):
+        await message.answer("❌ Only OWNER can add questions.")
+        return
+
+    poll = message.poll
+    if poll.type != "quiz" or poll.correct_option_id is None:
+        await message.answer("❌ Only QUIZ polls with correct answer can be saved.")
+        return
+
+    options = [o.text for o in poll.options]
+    q = Question(
+        text=poll.question,
+        options=options,
+        correct_id=int(poll.correct_option_id),
+        source_chat_id=message.chat.id,
+        source_message_id=message.message_id
     )
+    QUESTION_BANK.append(q)
+    save_question_bank(QUESTION_BANK)
 
-    await update.message.reply_text(welcome_text, parse_mode="HTML")
+    await message.answer(f"✅ Saved question.\nTotal: {len(QUESTION_BANK)}")
 
+# ===================== QUESTIONS: JSON IMPORT (DM) =====================
 
-# Admin management
-async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        return await update.message.reply_text("❌ অনুমতি নেই।")
-    if not context.args:
-        return await update.message.reply_text("Usage: /addadmin <user_id>")
-    new_admin = int(context.args[0])
-    ADMINS.add(new_admin)
-    await update.message.reply_text(f"✅ Admin added: {new_admin}")
+def validate_json_questions(obj: Any) -> Tuple[bool, str, List[Question]]:
+    """
+    Expected format:
+    [
+      {"question":"...", "options":{"A":"..","B":"..","C":"..","D":".."}, "correct_answer":"A"}
+    ]
+    """
+    if not isinstance(obj, list):
+        return False, "Root must be a JSON array (list).", []
+    out: List[Question] = []
+    for i, it in enumerate(obj, start=1):
+        if not isinstance(it, dict):
+            return False, f"Item #{i} must be an object.", []
+        qtext = it.get("question")
+        opts = it.get("options")
+        ca = it.get("correct_answer")
+        if not isinstance(qtext, str) or not qtext.strip():
+            return False, f"Item #{i}: 'question' must be a non-empty string.", []
+        if not isinstance(opts, dict):
+            return False, f"Item #{i}: 'options' must be an object with keys A/B/C/D.", []
+        for k in ["A", "B", "C", "D"]:
+            if k not in opts or not isinstance(opts[k], str):
+                return False, f"Item #{i}: options must include '{k}' as string.", []
+        if ca not in ["A", "B", "C", "D"]:
+            return False, f"Item #{i}: 'correct_answer' must be one of A/B/C/D.", []
 
-async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        return await update.message.reply_text("❌ অনুমতি নেই।")
-    if not context.args:
-        return await update.message.reply_text("Usage: /removeadmin <user_id>")
-    rem_admin = int(context.args[0])
-    ADMINS.discard(rem_admin)
-    await update.message.reply_text(f"✅ Admin removed: {rem_admin}")
+        options_list = [opts["A"], opts["B"], opts["C"], opts["D"]]
+        correct_id = ["A", "B", "C", "D"].index(ca)
+        out.append(Question(text=qtext.strip(), options=options_list, correct_id=correct_id))
+    return True, f"✅ Valid JSON. Questions: {len(out)}", out
 
-# Channel management
-async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        return await update.message.reply_text("❌ অনুমতি নেই।")
-    if len(context.args) < 2:
-        return await update.message.reply_text("Usage: /addchannel <channel_id> <name>")
-    cid, name = context.args[0], " ".join(context.args[1:])
-    CHANNELS[cid] = name
-    await update.message.reply_text(f"✅ Channel added: {name} ({cid})")
+@router.message(F.document, F.chat.type == ChatType.PRIVATE)
+async def handle_json_file_dm(message: Message, bot: Bot):
+    u = message.from_user
+    if not u:
+        return
+    if get_owner_id() == 0:
+        await message.answer(ensure_owner_claim_hint())
+        return
+    if not await is_owner(u.id):
+        await message.answer("❌ Only OWNER can import JSON.")
+        return
 
-async def list_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not CHANNELS:
-        return await update.message.reply_text("❌ কোনো চ্যানেল এড করা হয়নি।")
-    txt = "📡 Channels:\n" + "\n".join([f"{k}: {v}" for k,v in CHANNELS.items()])
-    await update.message.reply_text(txt)
+    doc = message.document
+    if not doc.file_name or not doc.file_name.lower().endswith(".json"):
+        return  # ignore other files
 
-# Prefix & Explanation
-async def set_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global QUESTION_PREFIX
-    if update.effective_user.id not in ADMINS:
-        return await update.message.reply_text("❌ অনুমতি নেই।")
-    QUESTION_PREFIX = " ".join(context.args)
-    await update.message.reply_text(f"✅ Prefix updated: {QUESTION_PREFIX}")
+    file = await bot.get_file(doc.file_id)
+    data = await bot.download_file(file.file_path)
+    raw = data.read()
 
-async def set_explanation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global AUTO_EXPLANATION_LINK
-    if update.effective_user.id not in ADMINS:
-        return await update.message.reply_text("❌ অনুমতি নেই।")
-    AUTO_EXPLANATION_LINK = " ".join(context.args)
-    await update.message.reply_text(f"✅ Explanation link updated: {AUTO_EXPLANATION_LINK}")
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except Exception:
+        await message.answer("❌ Invalid JSON (decode/parse failed).")
+        return
 
-# Quiz creation
-async def create_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        return await update.message.reply_text("❌ অনুমতি নেই।")
-    if not update.message.reply_to_message:
-        return await update.message.reply_text("❌ কুইজ ফরমেট রিপ্লাই করে /createquiz দিন।")
-    raw = update.message.reply_to_message.text
-    quizzes, errors = parse_multiple_quizzes(raw)
-    if not quizzes:
-        return await update.message.reply_text("❌ কোনো কুইজ পাওয়া যায়নি।")
-    # Show buttons for channels + inbox
-    buttons = [[InlineKeyboardButton("📥 Inbox", callback_data="target_inbox")]]
-    for cid, name in CHANNELS.items():
-        buttons.append([InlineKeyboardButton(f"📡 {name}", callback_data=f"target_{cid}")])
-    context.user_data["pending_quizzes"] = quizzes
-    await update.message.reply_text("📤 কোথায় পাঠাতে চান?", reply_markup=InlineKeyboardMarkup(buttons))
+    ok, msg, questions = validate_json_questions(obj)
+    if not ok:
+        await message.answer(f"❌ JSON Validation Failed:\n{msg}")
+        return
 
-async def target_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    quizzes = context.user_data.get("pending_quizzes", [])
-    target = q.data.replace("target_", "")
-    if target == "inbox":
-        chat_id = q.message.chat_id
+    QUESTION_BANK.extend(questions)
+    save_question_bank(QUESTION_BANK)
+    await message.answer(f"✅ Imported successfully.\nNow total questions: {len(QUESTION_BANK)}")
+
+@router.message(Command("json_template"), F.chat.type == ChatType.PRIVATE)
+async def cmd_json_template(message: Message):
+    tpl = [
+        {
+            "question": "What is the capital of France?",
+            "options": {"A": "Paris", "B": "London", "C": "Rome", "D": "Berlin"},
+            "correct_answer": "A",
+            "explanation": "Paris is the capital of France."
+        }
+    ]
+    await message.answer("📄 JSON Template (example):\n\n" + json.dumps(tpl, ensure_ascii=False, indent=2))
+
+@router.message(Command("validate_json"), F.chat.type == ChatType.PRIVATE)
+async def cmd_validate_json(message: Message, bot: Bot):
+    u = message.from_user
+    if not u:
+        return
+    if not message.reply_to_message or not message.reply_to_message.document:
+        await message.answer("Reply to a .json file with /validate_json")
+        return
+
+    doc = message.reply_to_message.document
+    if not doc.file_name or not doc.file_name.lower().endswith(".json"):
+        await message.answer("❌ That replied file is not .json")
+        return
+
+    file = await bot.get_file(doc.file_id)
+    data = await bot.download_file(file.file_path)
+    raw = data.read()
+
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except Exception:
+        await message.answer("❌ Invalid JSON (parse failed).")
+        return
+
+    ok, msg, _ = validate_json_questions(obj)
+    await message.answer(msg if ok else f"❌ {msg}")
+
+# ===================== ADMIN PANEL CALLBACKS =====================
+
+@router.callback_query(F.data == "noop")
+async def cb_noop(call: CallbackQuery):
+    await call.answer()
+
+@router.callback_query(F.data == "panel:close")
+async def cb_panel_close(call: CallbackQuery):
+    try:
+        await call.message.edit_text("✅ Closed.")
+    except Exception:
+        pass
+    await call.answer()
+
+@router.callback_query(F.data.startswith("panel:groups:"))
+async def cb_panel_groups(call: CallbackQuery):
+    u = call.from_user
+    if not u or not await is_owner(u.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    page = int(call.data.split(":")[-1])
+    await call.message.edit_text("📌 Select a group:", reply_markup=kb_groups(page, prefix="grp"))
+    await call.answer()
+
+@router.callback_query(F.data == "panel:qcount")
+async def cb_panel_qcount(call: CallbackQuery):
+    u = call.from_user
+    if not u or not await is_owner(u.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    await call.message.edit_text(f"📚 Saved Questions: {len(QUESTION_BANK)}", reply_markup=kb_admin_panel())
+    await call.answer()
+
+@router.callback_query(F.data == "panel:qclear")
+async def cb_panel_qclear(call: CallbackQuery):
+    u = call.from_user
+    if not u or not await is_owner(u.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    QUESTION_BANK.clear()
+    save_question_bank(QUESTION_BANK)
+    await call.message.edit_text("🧹 Question bank cleared.", reply_markup=kb_admin_panel())
+    await call.answer()
+
+@router.callback_query(F.data == "panel:announce")
+async def cb_panel_announce(call: CallbackQuery):
+    u = call.from_user
+    if not u or not await is_owner(u.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    txt = (
+        "📣 Announcement mode:\n\n"
+        "1) Send me ANY content (text/photo/video/file).\n"
+        "2) Reply to that message with /announce or /announce_pin.\n"
+        "3) I will show bound group list → click to post.\n"
+    )
+    await call.message.edit_text(txt, reply_markup=kb_admin_panel())
+    await call.answer()
+
+# ---------- group list pagination ----------
+@router.callback_query(F.data.startswith("grp:page:"))
+async def cb_grp_page(call: CallbackQuery):
+    page = int(call.data.split(":")[-1])
+    await call.message.edit_reply_markup(reply_markup=kb_groups(page, prefix="grp"))
+    await call.answer()
+
+@router.callback_query(F.data == "grp:close")
+async def cb_grp_close(call: CallbackQuery):
+    try:
+        await call.message.edit_text("✅ Closed.")
+    except Exception:
+        pass
+    await call.answer()
+
+@router.callback_query(F.data.startswith("grp:pick:"))
+async def cb_grp_pick(call: CallbackQuery):
+    u = call.from_user
+    if not u or not await is_owner(u.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    chat_id = call.data.split(":")[-1]
+    await call.message.edit_text(format_preset(chat_id), reply_markup=kb_group_actions(chat_id), parse_mode="Markdown")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("gact:open:"))
+async def cb_gact_open(call: CallbackQuery):
+    chat_id = call.data.split(":")[-1]
+    await call.message.edit_text(format_preset(chat_id), reply_markup=kb_group_actions(chat_id), parse_mode="Markdown")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("gact:ready:"))
+async def cb_gact_ready(call: CallbackQuery):
+    chat_id = call.data.split(":")[-1]
+    p = preset_for(chat_id)
+    p.ready = True
+    save_preset(chat_id, p)
+    await call.message.edit_text(format_preset(chat_id), reply_markup=kb_group_actions(chat_id), parse_mode="Markdown")
+    await call.answer("READY ✅")
+
+@router.callback_query(F.data.startswith("gact:setname:"))
+async def cb_gact_setname(call: CallbackQuery):
+    chat_id = call.data.split(":")[-1]
+    WIZARD_STATE[call.from_user.id] = {"mode": "setname", "chat_id": chat_id, "panel_msg": (call.message.chat.id, call.message.message_id)}
+    await call.answer()
+    await call.message.edit_text("📝 Send exam name in this DM (just type).", reply_markup=None)
+
+@router.callback_query(F.data.startswith("gact:settime:"))
+async def cb_gact_settime(call: CallbackQuery):
+    chat_id = call.data.split(":")[-1]
+    WIZARD_STATE[call.from_user.id] = {"mode": "settime", "chat_id": chat_id, "panel_msg": (call.message.chat.id, call.message.message_id)}
+    await call.answer()
+    await call.message.edit_text("⏱ Send time per question in seconds (e.g., 30).", reply_markup=None)
+
+@router.callback_query(F.data.startswith("gact:setmarks:"))
+async def cb_gact_setmarks(call: CallbackQuery):
+    chat_id = call.data.split(":")[-1]
+    WIZARD_STATE[call.from_user.id] = {"mode": "setmarks", "chat_id": chat_id, "panel_msg": (call.message.chat.id, call.message.message_id)}
+    await call.answer()
+    await call.message.edit_text("🎯 Send marks format: +mark -negative\nExample: 1 0.25", reply_markup=None)
+
+@router.callback_query(F.data.startswith("gact:schedule:"))
+async def cb_gact_schedule(call: CallbackQuery):
+    chat_id = call.data.split(":")[-1]
+    await call.message.edit_text("🗓 Choose schedule:", reply_markup=kb_schedule(chat_id))
+    await call.answer()
+
+@router.callback_query(F.data.startswith("sch:"))
+async def cb_schedule_pick(call: CallbackQuery, bot: Bot):
+    # sch:<chat_id>:<minutes or custom>
+    _, chat_id, mins = call.data.split(":")
+    if mins == "custom":
+        WIZARD_STATE[call.from_user.id] = {"mode": "schedule_custom", "chat_id": chat_id, "panel_msg": (call.message.chat.id, call.message.message_id)}
+        await call.message.edit_text("🗓 Send date-time in format: YYYY-MM-DD HH:MM\nTimezone: Asia/Dhaka", reply_markup=None)
+        await call.answer()
+        return
+
+    minutes = int(mins)
+    run_at = datetime.now() + timedelta(minutes=minutes)
+    key = f"scheduled:{chat_id}"
+    # cancel previous
+    t = SCHEDULE_TASKS.pop((int(chat_id), key), None)
+    if t:
+        t.cancel()
+
+    async def _job():
+        await asyncio.sleep(minutes * 60)
+        await start_exam_in_group(bot, int(chat_id), initiator_id=call.from_user.id)
+
+    SCHEDULE_TASKS[(int(chat_id), key)] = asyncio.create_task(_job())
+    await call.message.edit_text(f"✅ Scheduled in {minutes} minutes.\n(At: {run_at.strftime('%Y-%m-%d %H:%M')})",
+                                reply_markup=kb_group_actions(chat_id))
+    await call.answer("Scheduled ✅")
+
+@router.callback_query(F.data.startswith("gact:start:"))
+async def cb_gact_start(call: CallbackQuery, bot: Bot):
+    chat_id = int(call.data.split(":")[-1])
+    await call.answer("Starting...")
+    ok, msg = await start_exam_in_group(bot, chat_id, initiator_id=call.from_user.id)
+    await call.message.edit_text(msg, reply_markup=kb_admin_panel())
+
+# ===================== WIZARD INPUT HANDLER (DM TEXT) =====================
+
+@router.message(F.text, F.chat.type == ChatType.PRIVATE)
+async def handle_wizard_text(message: Message):
+    u = message.from_user
+    if not u:
+        return
+    st = WIZARD_STATE.get(u.id)
+    if not st:
+        return  # normal text ignored
+
+    mode = st.get("mode")
+    chat_id = st.get("chat_id")
+    panel = st.get("panel_msg")
+    if not chat_id or not panel:
+        WIZARD_STATE.pop(u.id, None)
+        return
+
+    try:
+        if mode == "setname":
+            name = message.text.strip()
+            p = preset_for(chat_id)
+            p.exam_name = name
+            p.ready = False
+            save_preset(chat_id, p)
+
+        elif mode == "settime":
+            t = int(message.text.strip())
+            if t < 5 or t > 600:
+                await message.answer("❌ Time must be between 5 and 600 seconds.")
+                return
+            p = preset_for(chat_id)
+            p.time_per_q = t
+            p.ready = False
+            save_preset(chat_id, p)
+
+        elif mode == "setmarks":
+            parts = message.text.strip().split()
+            if len(parts) != 2:
+                await message.answer("❌ Format must be: <mark_per_q> <negative>  e.g., 1 0.25")
+                return
+            mpq = float(parts[0])
+            neg = float(parts[1])
+            if mpq <= 0 or neg < 0:
+                await message.answer("❌ Invalid values.")
+                return
+            p = preset_for(chat_id)
+            p.mark_per_q = mpq
+            p.negative_mark = neg
+            p.ready = False
+            save_preset(chat_id, p)
+
+        elif mode == "schedule_custom":
+            # YYYY-MM-DD HH:MM
+            dt = datetime.strptime(message.text.strip(), "%Y-%m-%d %H:%M")
+            now = datetime.now()
+            if dt <= now:
+                await message.answer("❌ Time must be in the future.")
+                return
+            delay = int((dt - now).total_seconds())
+            key = f"scheduled:{chat_id}"
+
+            # cancel previous
+            t = SCHEDULE_TASKS.pop((int(chat_id), key), None)
+            if t:
+                t.cancel()
+
+            async def _job():
+                await asyncio.sleep(delay)
+                await start_exam_in_group(message.bot, int(chat_id), initiator_id=u.id)
+
+            SCHEDULE_TASKS[(int(chat_id), key)] = asyncio.create_task(_job())
+
+        else:
+            pass
+
+        # update the same panel message (edit)
+        WIZARD_STATE.pop(u.id, None)
+        try:
+            await message.bot.edit_message_text(
+                chat_id=panel[0],
+                message_id=panel[1],
+                text=format_preset(chat_id),
+                reply_markup=kb_group_actions(chat_id),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+        await message.answer("✅ Saved. Panel updated.")
+
+    except Exception as e:
+        WIZARD_STATE.pop(u.id, None)
+        await message.answer(f"❌ Error: {e}")
+
+# ===================== ANNOUNCEMENT (DM REPLY COMMAND) =====================
+
+@router.message(Command("announce"), F.chat.type == ChatType.PRIVATE)
+async def cmd_announce(message: Message):
+    u = message.from_user
+    if not u or not await is_owner(u.id):
+        await message.answer("❌ Only OWNER can announce.")
+        return
+    if not message.reply_to_message:
+        await message.answer("Reply to a content message (photo/video/file/text) with /announce")
+        return
+
+    # store draft reference
+    ANNOUNCE_DRAFT[u.id] = (message.reply_to_message.chat.id, message.reply_to_message.message_id)
+    await message.answer("📣 Select a group to post:", reply_markup=kb_groups(0, prefix="ann"))
+
+@router.message(Command("announce_pin"), F.chat.type == ChatType.PRIVATE)
+async def cmd_announce_pin(message: Message):
+    u = message.from_user
+    if not u or not await is_owner(u.id):
+        await message.answer("❌ Only OWNER can announce.")
+        return
+    if not message.reply_to_message:
+        await message.answer("Reply to a content message with /announce_pin")
+        return
+    ANNOUNCE_DRAFT[u.id] = (message.reply_to_message.chat.id, message.reply_to_message.message_id)
+    await message.answer("📌 Select a group to post & pin:", reply_markup=kb_groups(0, prefix="annpin"))
+
+@router.callback_query(F.data.startswith("ann:page:"))
+async def cb_ann_page(call: CallbackQuery):
+    page = int(call.data.split(":")[-1])
+    await call.message.edit_reply_markup(reply_markup=kb_groups(page, prefix="ann"))
+    await call.answer()
+
+@router.callback_query(F.data.startswith("annpin:page:"))
+async def cb_annpin_page(call: CallbackQuery):
+    page = int(call.data.split(":")[-1])
+    await call.message.edit_reply_markup(reply_markup=kb_groups(page, prefix="annpin"))
+    await call.answer()
+
+@router.callback_query(F.data.startswith("ann:pick:"))
+async def cb_ann_pick(call: CallbackQuery, bot: Bot):
+    u = call.from_user
+    draft = ANNOUNCE_DRAFT.get(u.id)
+    if not draft:
+        await call.answer("No draft found. Reply /announce again.", show_alert=True)
+        return
+    group_id = int(call.data.split(":")[-1])
+    src_chat, src_msg = draft
+    try:
+        await bot.copy_message(chat_id=group_id, from_chat_id=src_chat, message_id=src_msg)
+        await call.message.edit_text("✅ Posted successfully.")
+    except Exception as e:
+        await call.message.edit_text(f"❌ Failed: {e}")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("annpin:pick:"))
+async def cb_annpin_pick(call: CallbackQuery, bot: Bot):
+    u = call.from_user
+    draft = ANNOUNCE_DRAFT.get(u.id)
+    if not draft:
+        await call.answer("No draft found. Reply /announce_pin again.", show_alert=True)
+        return
+    group_id = int(call.data.split(":")[-1])
+    src_chat, src_msg = draft
+    try:
+        sent = await bot.copy_message(chat_id=group_id, from_chat_id=src_chat, message_id=src_msg)
+        # try pin
+        try:
+            await bot.pin_chat_message(chat_id=group_id, message_id=sent.message_id)
+        except Exception:
+            pass
+        await call.message.edit_text("✅ Posted (pin attempted).")
+    except Exception as e:
+        await call.message.edit_text(f"❌ Failed: {e}")
+    await call.answer()
+
+@router.callback_query(F.data == "ann:close")
+async def cb_ann_close(call: CallbackQuery):
+    try:
+        await call.message.edit_text("✅ Closed.")
+    except Exception:
+        pass
+    await call.answer()
+
+@router.callback_query(F.data == "annpin:close")
+async def cb_annpin_close(call: CallbackQuery):
+    try:
+        await call.message.edit_text("✅ Closed.")
+    except Exception:
+        pass
+    await call.answer()
+
+# ===================== EXAM COMMANDS (GROUP) =====================
+
+async def start_exam_in_group(bot: Bot, chat_id: int, initiator_id: int) -> Tuple[bool, str]:
+    # validate questions
+    if not QUESTION_BANK:
+        return False, "❌ No questions saved. Add quiz polls or JSON in bot DM."
+
+    cid = str(chat_id)
+    p = preset_for(cid)
+    if not p.ready:
+        return False, "❌ Preset is NOT READY.\nOpen bot DM → /admin_panel → Groups → Setup → READY."
+
+    # block if already active
+    if chat_id in EXAMS and EXAMS[chat_id].active:
+        return False, "⚠️ Exam already running."
+
+    session = ExamSession(
+        chat_id=chat_id,
+        questions=list(QUESTION_BANK),
+        exam_name=p.exam_name,
+        time_per_question=p.time_per_q,
+        mark_per_q=p.mark_per_q,
+        negative_mark=p.negative_mark,
+        active=True,
+        admin_id=initiator_id,
+        started_at=datetime.utcnow()
+    )
+    EXAMS[chat_id] = session
+
+    await bot.send_message(
+        chat_id,
+        f"📝 Exam Started: {session.exam_name}\n\n"
+        f"Total Questions: {len(session.questions)}\n"
+        f"Time/Question: {session.time_per_question}s\n"
+        f"Mark: +{session.mark_per_q}\n"
+        f"Negative: -{session.negative_mark}\n\n"
+        "⚠️ During exam, messages are locked for non-admins."
+    )
+    asyncio.create_task(run_exam(session, bot))
+    return True, "✅ Exam started."
+
+@router.message(Command("start_exam"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def cmd_start_exam_group(message: Message, bot: Bot, command: CommandObject):
+    u = message.from_user
+    if not u:
+        return
+    if not await is_admin_or_owner(bot, message.chat.id, u.id):
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await bot.send_message(u.id, "⚠️ Not allowed. Contact: @Your_Himus / @Probaho_Robot")
+        return
+
+    # allow override: /start_exam "Name" 30 1 0.25
+    args = command.args or ""
+    if args.strip():
+        # very simple parser: name inside quotes optional
+        name = None
+        rest = args.strip()
+        if rest.startswith('"') and '"' in rest[1:]:
+            end = rest[1:].index('"') + 1
+            name = rest[1:end]
+            rest = rest[end+1:].strip()
+        parts = rest.split()
+        try:
+            t = int(parts[0]) if len(parts) >= 1 else TIME_PER_Q_DEFAULT
+            mpq = float(parts[1]) if len(parts) >= 2 else RIGHT_MARK_DEFAULT
+            neg = float(parts[2]) if len(parts) >= 3 else NEGATIVE_DEFAULT
+        except Exception:
+            await message.answer("❌ Invalid args. Example: /start_exam \"English Model Test\" 30 1 0.25")
+            return
+
+        cid = str(message.chat.id)
+        p = preset_for(cid)
+        if name:
+            p.exam_name = name
+        p.time_per_q = t
+        p.mark_per_q = mpq
+        p.negative_mark = neg
+        p.ready = True
+        save_preset(cid, p)
+
+    ok, msg = await start_exam_in_group(bot, message.chat.id, u.id)
+    if not ok:
+        await message.answer(msg)
+
+@router.message(Command("stop_exam"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def cmd_stop_exam(message: Message, bot: Bot):
+    u = message.from_user
+    if not u:
+        return
+    if not await is_admin_or_owner(bot, message.chat.id, u.id):
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await bot.send_message(u.id, "⚠️ Not allowed. Contact: @Your_Himus / @Probaho_Robot")
+        return
+
+    session = EXAMS.get(message.chat.id)
+    if not session or not session.active:
+        await message.answer("ℹ️ No active exam.")
+        return
+
+    session.active = False
+    await message.answer("⛔ Exam stopped. Generating results...")
+    await finish_exam(session, bot)
+
+# ===================== GROUP LOCK (EXAM ACTIVE) =====================
+
+@router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def group_lock_handler(message: Message, bot: Bot):
+    session = EXAMS.get(message.chat.id)
+    if not session or not session.active:
+        return
+
+    u = message.from_user
+    if not u:
+        return
+
+    allowed = await is_admin_or_owner(bot, message.chat.id, u.id)
+    if allowed:
+        return
+
+    # delete any message
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # warning DM (do not spam: basic)
+    try:
+        await bot.send_message(
+            u.id,
+            "⚠️ Exam is running. Messaging is disabled.\nContact: @Your_Himus / @Probaho_Robot"
+        )
+    except Exception:
+        pass
+
+# ===================== POLL ANSWERS =====================
+
+@router.poll_answer()
+async def handle_poll_answer(poll_answer: PollAnswer):
+    poll_id = poll_answer.poll_id
+    user = poll_answer.user
+    chosen_option_ids = poll_answer.option_ids or []
+
+    target_session: Optional[ExamSession] = None
+    q_idx: Optional[int] = None
+
+    for s in EXAMS.values():
+        if poll_id in s.poll_id_to_q_idx:
+            target_session = s
+            q_idx = s.poll_id_to_q_idx[poll_id]
+            break
+    if target_session is None or q_idx is None:
+        return
+
+    s = target_session
+    answered_set = s.answered_users_per_q.setdefault(q_idx, set())
+    if user.id in answered_set:
+        return
+    answered_set.add(user.id)
+
+    if user.id not in s.results:
+        s.results[user.id] = UserResult(
+            user_id=user.id,
+            full_name=(user.full_name or "Unknown"),
+            username=user.username
+        )
+    r = s.results[user.id]
+
+    if not chosen_option_ids:
+        return
+
+    chosen = chosen_option_ids[0]
+    correct_id = s.questions[q_idx].correct_id
+
+    if chosen == correct_id:
+        r.correct += 1
+        r.score += s.mark_per_q
+        r.answers[q_idx] = "C"
     else:
-        chat_id = target
-    ok, bad = 0, 0
-    for quiz in quizzes:
-        try:
-            await context.bot.send_poll(
-                chat_id=chat_id,
-                question=quiz["question"],
-                options=quiz["options"],
-                type=Poll.QUIZ,
-                correct_option_id=quiz["correct_option_index"],
-                explanation=quiz["explanation"],
-                is_anonymous=True
+        r.wrong += 1
+        r.score -= s.negative_mark
+        r.answers[q_idx] = "W"
+
+# ===================== EXAM FLOW =====================
+
+async def run_exam(session: ExamSession, bot: Bot):
+    try:
+        total_q = len(session.questions)
+        for idx, q in enumerate(session.questions):
+            if not session.active:
+                break
+            session.current_index = idx
+
+            msg = await bot.send_poll(
+                chat_id=session.chat_id,
+                question=f"Q{idx+1}/{total_q}: {q.text}",
+                options=q.options,
+                type="quiz",
+                correct_option_id=q.correct_id,
+                is_anonymous=False,
+                open_period=session.time_per_question,
             )
-            ok += 1
-            await asyncio.sleep(0.3)
-        except:
-            bad += 1
-    await q.message.reply_text(f"📤 কুইজ পাঠানো সম্পন্ন!\n✔️ সফল: {ok}\n❌ ব্যর্থ: {bad}")
+            session.poll_id_to_q_idx[msg.poll.id] = idx
+            session.answered_users_per_q.setdefault(idx, set())
 
-async def extract_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        return await update.message.reply_text("❌ অনুমতি নেই।")
+            await asyncio.sleep(session.time_per_question + 2)
 
-    messages = []
+        session.active = False
+        await finish_exam(session, bot)
 
-    # যদি reply করা মেসেজ থাকে
-    if update.message.reply_to_message:
-        messages.append(update.message.reply_to_message)
-
-    # যদি current মেসেজে poll থাকে
-    if update.message.poll:
-        messages.append(update.message)
-
-    if not messages:
-        return await update.message.reply_text("❌ কোনো forwarded quiz poll পাওয়া যায়নি।")
-
-    ok, bad = 0, 0
-    for msg in messages:
-        if not msg.poll or msg.poll.type != "quiz":
-            bad += 1
-            continue
-
-        poll = msg.poll
-        question = poll.question
-        options = [opt.text for opt in poll.options]
-        correct_idx = poll.correct_option_id if poll.correct_option_id is not None else 0
-
-        # পুরনো prefix থাকলে সরাও
-        question = clean_question(poll.question)
-
-
-        # নতুন prefix বসাও
-        final_question = f"{QUESTION_PREFIX}\n\n{question}"
-
-        # explanation বাদ যাবে, শুধু তোমার link বসবে
-        final_explanation = AUTO_EXPLANATION_LINK
-
+    except Exception as e:
+        logging.exception("run_exam error: %s", e)
         try:
-            await context.bot.send_poll(
-                chat_id=update.effective_chat.id,
-                question=final_question,
-                options=options,
-                type=Poll.QUIZ,
-                correct_option_id=correct_idx,
-                explanation=final_explanation,
-                is_anonymous=True
+            await bot.send_message(session.chat_id, "❌ Unexpected error occurred.")
+        except Exception:
+            pass
+
+async def finish_exam(session: ExamSession, bot: Bot):
+    if session.finished:
+        return
+    session.finished = True
+    total_q = len(session.questions)
+
+    # fill skipped
+    for r in session.results.values():
+        answered = r.correct + r.wrong
+        r.skipped = total_q - answered
+        for qi in range(total_q):
+            if qi not in r.answers:
+                r.answers[qi] = "S"
+
+    sorted_results = sorted(session.results.values(), key=lambda x: (-x.score, -x.correct))
+    if not sorted_results:
+        await bot.send_message(session.chat_id, "ℹ️ No one answered.")
+    else:
+        top_n = min(10, len(sorted_results))
+        lines = [f"🏆 Leaderboard: {session.exam_name}\n"]
+        for i, r in enumerate(sorted_results[:top_n], start=1):
+            name = r.full_name + (f" (@{r.username})" if r.username else "")
+            lines.append(f"{i}. {name} — {r.score:.2f} (C:{r.correct} W:{r.wrong} S:{r.skipped})")
+        await bot.send_message(session.chat_id, "\n".join(lines))
+
+        # DM detailed results
+        for rank, r in enumerate(sorted_results, start=1):
+            msg = (
+                f"📌 Exam: {session.exam_name}\n"
+                f"Rank: {rank}\n"
+                f"Score: {r.score:.2f}\n"
+                f"Correct: {r.correct}\nWrong: {r.wrong}\nSkipped: {r.skipped}\n\n"
+                "Motivation:\n"
+                "Keep going — consistency beats talent when talent doesn’t stay consistent."
             )
-            ok += 1
-            await asyncio.sleep(0.3)
-        except Exception as e:
-            bad += 1
+            try:
+                await bot.send_message(r.user_id, msg)
+            except Exception:
+                pass
 
-    await update.message.reply_text(f"📤 Extracted quizzes!\n✔️ সফল: {ok}\n❌ ব্যর্থ: {bad}")
+    # clear everything after exam (as you requested)
+    EXAMS.pop(session.chat_id, None)
+    QUESTION_BANK.clear()
+    save_question_bank(QUESTION_BANK)
 
-# forwarded polls জমা রাখার জন্য
-FORWARDED_POLLS = []
+    # preset becomes not ready (must setup again)
+    cid = str(session.chat_id)
+    p = preset_for(cid)
+    p.ready = False
+    save_preset(cid, p)
 
-async def collect_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.poll and update.message.poll.type == "quiz":
-        FORWARDED_POLLS.append(update.message.poll)
+    await bot.send_message(session.chat_id, "✅ Exam finished. Data cleared. Setup again for next exam.")
 
-async def extract_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMINS:
-        return await update.message.reply_text("❌ অনুমতি নেই।")
+# ====================== MAIN ======================
 
-    if not FORWARDED_POLLS:
-        return await update.message.reply_text("❌ কোনো forwarded quiz poll পাওয়া যায়নি।")
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is missing. Set it in Windows PowerShell: $env:BOT_TOKEN='...'.")
+    bot = Bot(BOT_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
 
-    ok, bad = 0, 0
-    for poll in FORWARDED_POLLS:
-    # প্রশ্ন আগের মতোই clean
-        question = clean_question(poll.question)
-
-    # ✅ এখানেই অপশন clean + split হবে
-        raw_options = [opt.text for opt in poll.options]
-
-        # 1️⃣ অপশন clean
-        options = clean_options(raw_options)
-
-        # 2️⃣ correct index আগের মতো নাও
-        correct_idx = poll.correct_option_id if poll.correct_option_id is not None else 0
-
-        # 3️⃣ অপশন shuffle + correct index ঠিক করা
-        options, correct_idx = shuffle_options(options, correct_idx)
-
-
-
-        # prefix বসাও
-        question = clean_question(poll.question)
-
-        final_question = f"{QUESTION_PREFIX}\n{question}"
-        final_explanation = AUTO_EXPLANATION_LINK
-
-        try:
-            await context.bot.send_poll(
-                chat_id=update.effective_chat.id,
-                question=final_question,
-                options=options,
-                type=Poll.QUIZ,
-                correct_option_id=correct_idx,
-                explanation=final_explanation,
-                is_anonymous=True
-            )
-            ok += 1
-            await asyncio.sleep(0.3)
-        except:
-            bad += 1
-
-    # প্রসেস শেষে list খালি করে দাও
-    FORWARDED_POLLS.clear()
-
-    await update.message.reply_text(f"📤 Extracted quizzes!\n✔️ সফল: {ok}\n❌ ব্যর্থ: {bad}")
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "<b>📖 Ultron Bot Help</b>\n\n"
-        "এই বট দিয়ে আপনি যা করতে পারবেন:\n\n"
-        "👑 <b>Admin Management</b>\n"
-        "  • /addadmin &lt;user_id&gt; → নতুন অ্যাডমিন যোগ করুন\n"
-        "  • /removeadmin &lt;user_id&gt; → অ্যাডমিন রিমুভ করুন\n\n"
-        "📡 <b>Channel Management</b>\n"
-        "  • /addchannel &lt;channel_id&gt; &lt;name&gt; → নতুন চ্যানেল যোগ করুন\n"
-        "  • /listchannels → সব চ্যানেল লিস্ট দেখুন\n\n"
-        "✏️ <b>Customization</b>\n"
-        "  • /setprefix &lt;text&gt; → প্রশ্নের prefix পরিবর্তন করুন\n"
-        "  • /setexplanation &lt;text&gt; → explanation link পরিবর্তন করুন\n\n"
-        "🧠 <b>Quiz Creation</b>\n"
-        "  • /createquiz → কুইজ ফরমেট রিপ্লাই করে দিন, তারপর target বেছে নিন\n"
-        "  • /extractbatch → একসাথে অনেক forwarded quiz প্রসেস করুন\n\n"
-        "ℹ️ <b>General</b>\n"
-        "  • /start → বট শুরু করুন\n"
-        "  • /help → এই সাহায্য মেনু দেখুন\n\n"
-        "✅ সব quiz prefix + explanation link সহ পাঠানো হবে\n"
-        "✅ target হিসেবে Inbox বা যেকোনো চ্যানেল বেছে নিতে পারবেন\n"
-        "✅ errorless advanced bot 🎯"
-    )
-    await update.message.reply_text(help_text, parse_mode="HTML")
-
-
-
-# ----------------- MAIN -----------------
-def main():
-    token = "8361665792:AAFDRGmPrBX_ycKts4ci1lHMfgQwI83DEBs"  # অথবা সরাসরি "YOUR_TOKEN"
-    app = Application.builder().token(token).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("addadmin", add_admin))
-    app.add_handler(CommandHandler("removeadmin", remove_admin))
-    app.add_handler(CommandHandler("addchannel", add_channel))
-    app.add_handler(CommandHandler("listchannels", list_channels))
-    app.add_handler(CommandHandler("setprefix", set_prefix))
-    app.add_handler(CommandHandler("setexplanation", set_explanation))
-    app.add_handler(CommandHandler("createquiz", create_quiz))
-        # CallbackQueryHandler for target selection
-    app.add_handler(CallbackQueryHandler(target_selected, pattern="^target_"))
-    app.add_handler(CommandHandler("extractbatch", extract_batch))
-    from telegram.ext import MessageHandler, filters
-
-    app.add_handler(MessageHandler(filters.POLL, collect_forwarded))
-    app.add_handler(CommandHandler("help", help_command))
-
-    # Run the bot
-    app.run_polling()
+    logging.info("Bot starting (aiogram v3 polling)...")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
