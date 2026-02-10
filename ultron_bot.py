@@ -4,40 +4,95 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Any, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.enums import ChatType
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ChatType, ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
-    Message, PollAnswer,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, FSInputFile
+    Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    PollAnswer,
 )
+from aiogram.exceptions import TelegramBadRequest
 
-# ===================== CONFIG =====================
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import cm
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
+
+# =========================================================
+#  CODE-FIXED CONFIG (NO ENV, NO CLAIM OWNER)
+# =========================================================
+BOT_TOKEN = "8427023407:AAFagu6UcMGJAI2_jJksQTZ0P_Hj9JQTWrI"  # ✅ fixed bot token (STR)
+
+OWNER_ID = 8389621809  # ✅ fixed owner (INT)
+
+# Put your internal admins here (INT user IDs). Only these can use bot.
+INTERNAL_ADMINS: Set[int] = {
+    # 111111111,
+    # 222222222,
+}
+
+# Contacts shown to non-authorized users
+CONTACT_OWNER_1 = "@Your_Himus"
+CONTACT_OWNER_2 = "@Probaho_Robot"
+
+# Defaults
+DEFAULT_TIME_PER_Q = 30
+DEFAULT_MARK_PER_Q = 1.0
+DEFAULT_NEGATIVE = 0.25
+
+# Data dir
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-OWNER_FILE = os.path.join(DATA_DIR, "owner.json")
-GROUPS_FILE = os.path.join(DATA_DIR, "groups.json")
-PRESETS_FILE = os.path.join(DATA_DIR, "presets.json")
-QUESTIONS_FILE = os.path.join(DATA_DIR, "questions.json")
+# Fonts directory (put Bangla + Emoji fonts here)
+FONTS_DIR = "fonts"
+os.makedirs(FONTS_DIR, exist_ok=True)
 
-BOT_TOKEN = "8318888870:AAG_HjP0ucgmq4zDUKsXgEFjj5371LffnZI"  # windows powershell uses $env:BOT_TOKEN
-RIGHT_MARK_DEFAULT = 1.0
-NEGATIVE_DEFAULT = 0.25
-TIME_PER_Q_DEFAULT = 30
+# Recommended font files (place inside ./fonts)
+# - NotoSansBengali-Regular.ttf  (Bangla)
+# - NotoEmoji-Regular.ttf        (Emoji monochrome; works better for PDF than color emoji)
+# If not found, bot falls back to common Windows fonts.
+BENGALI_FONT_FILES = [
+    os.path.join(FONTS_DIR, "NotoSansBengali-Regular.ttf"),
+    os.path.join(FONTS_DIR, "SolaimanLipi.ttf"),
+    os.path.join(FONTS_DIR, "Nikosh.ttf"),
+    "C:/Windows/Fonts/vrinda.ttf",
+]
+EMOJI_FONT_FILES = [
+    os.path.join(FONTS_DIR, "NotoEmoji-Regular.ttf"),
+    "C:/Windows/Fonts/seguiemj.ttf",  # Segoe UI Emoji (Windows)
+]
+LATIN_FONT_FILES = [
+    "C:/Windows/Fonts/segoeui.ttf",
+    "C:/Windows/Fonts/segoeuib.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+    "C:/Windows/Fonts/calibri.ttf",
+]
 
-# =================== DATA MODELS ===================
+GROUPS_FILE = os.path.join(DATA_DIR, "groups.json")       # bound groups
+PRESETS_FILE = os.path.join(DATA_DIR, "presets.json")     # per-group exam presets
+QUESTIONS_FILE = os.path.join(DATA_DIR, "questions.json") # question bank
 
+
+# =========================================================
+#  MODELS
+# =========================================================
 @dataclass
 class Question:
     text: str
-    options: List[str]   # ["a","b","c","d"]
-    correct_id: int      # 0..3
-    # optional: source info
+    options: List[str]
+    correct_id: int  # 0..3
+    # where poll was posted (for links)
     source_chat_id: Optional[int] = None
     source_message_id: Optional[int] = None
 
@@ -51,52 +106,61 @@ class UserResult:
     wrong: int = 0
     skipped: int = 0
     score: float = 0.0
-    answers: Dict[int, str] = field(default_factory=dict)  # q_index -> "C/W/S"
+    answers: Dict[int, str] = field(default_factory=dict)  # q_idx -> C/W/S
 
 
 @dataclass
 class ExamPreset:
     exam_name: str = "Untitled Exam"
-    time_per_q: int = TIME_PER_Q_DEFAULT
-    mark_per_q: float = RIGHT_MARK_DEFAULT
-    negative_mark: float = NEGATIVE_DEFAULT
+    time_per_q: int = DEFAULT_TIME_PER_Q
+    mark_per_q: float = DEFAULT_MARK_PER_Q
+    negative: float = DEFAULT_NEGATIVE
     ready: bool = False
 
 
 @dataclass
 class ExamSession:
     chat_id: int
-    questions: List[Question]
     exam_name: str
-    time_per_question: int
+    time_per_q: int
     mark_per_q: float
-    negative_mark: float
+    negative: float
+    questions: List[Question]
     active: bool = False
     finished: bool = False
-
     current_index: int = 0
+
     poll_id_to_q_idx: Dict[str, int] = field(default_factory=dict)
+    posted_message_ids: Dict[int, int] = field(default_factory=dict)  # q_idx -> message_id in group
+
+    intro_message_id: Optional[int] = None
+    pin_cleanup_until: Optional[datetime] = None
+
     results: Dict[int, UserResult] = field(default_factory=dict)
     answered_users_per_q: Dict[int, Set[int]] = field(default_factory=dict)
 
-    admin_id: Optional[int] = None  # who started
-    started_at: Optional[datetime] = None
 
-
-# =================== GLOBAL STATE ===================
-
+# =========================================================
+#  STATE
+# =========================================================
 router = Router()
+EXAMS: Dict[int, ExamSession] = {}
 
-EXAMS: Dict[int, ExamSession] = {}                    # chat_id -> session
-SCHEDULE_TASKS: Dict[Tuple[int, str], asyncio.Task] = {}  # (chat_id, key) -> task
-
-# For DM announcement draft: admin_id -> (message_chat_id, message_id)
+# DM announcement draft (admin_id -> (chat_id, msg_id))
 ANNOUNCE_DRAFT: Dict[int, Tuple[int, int]] = {}
-# For DM wizard input: user_id -> dict state
-WIZARD_STATE: Dict[int, Dict[str, Any]] = {}
+# DM last content cache (admin_id -> (chat_id, msg_id))
+LAST_DM_CONTENT: Dict[int, Tuple[int, int]] = {}
 
-# =================== STORAGE HELPERS ===================
+# Wizard state (admin_id -> dict)
+WIZARD: Dict[int, Dict[str, Any]] = {}
 
+# Scheduled jobs
+SCHEDULE_TASKS: Dict[Tuple[int, str], asyncio.Task] = {}
+
+
+# =========================================================
+#  STORAGE
+# =========================================================
 def _load_json(path: str, default):
     try:
         if not os.path.exists(path):
@@ -112,92 +176,106 @@ def _save_json(path: str, data) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
-def get_owner_id() -> int:
-    data = _load_json(OWNER_FILE, {"owner_id": 0})
-    return int(data.get("owner_id", 0) or 0)
-
-def set_owner_id(owner_id: int) -> None:
-    _save_json(OWNER_FILE, {"owner_id": int(owner_id)})
-
-def get_bound_groups() -> Dict[str, Dict[str, Any]]:
-    # {"-100xxx": {"title": "...", "type": "supergroup", "bound_at": "..."}}
+def load_groups() -> Dict[str, Dict[str, Any]]:
     return _load_json(GROUPS_FILE, {})
 
-def save_bound_groups(groups: Dict[str, Dict[str, Any]]) -> None:
-    _save_json(GROUPS_FILE, groups)
+def save_groups(d: Dict[str, Dict[str, Any]]) -> None:
+    _save_json(GROUPS_FILE, d)
 
-def get_presets() -> Dict[str, Dict[str, Any]]:
+def load_presets() -> Dict[str, Dict[str, Any]]:
     return _load_json(PRESETS_FILE, {})
 
-def save_presets(presets: Dict[str, Dict[str, Any]]) -> None:
-    _save_json(PRESETS_FILE, presets)
+def save_presets(d: Dict[str, Dict[str, Any]]) -> None:
+    _save_json(PRESETS_FILE, d)
 
-def load_question_bank() -> List[Question]:
+def load_questions() -> List[Question]:
     raw = _load_json(QUESTIONS_FILE, [])
     out: List[Question] = []
     for it in raw:
         try:
-            out.append(Question(
-                text=str(it["text"]),
-                options=list(it["options"]),
-                correct_id=int(it["correct_id"]),
-                source_chat_id=it.get("source_chat_id"),
-                source_message_id=it.get("source_message_id"),
-            ))
+            out.append(
+                Question(
+                    text=str(it["text"]),
+                    options=list(it["options"]),
+                    correct_id=int(it["correct_id"]),
+                    source_chat_id=it.get("source_chat_id"),
+                    source_message_id=it.get("source_message_id"),
+                )
+            )
         except Exception:
             continue
     return out
 
-def save_question_bank(qs: List[Question]) -> None:
+def save_questions(qs: List[Question]) -> None:
     raw = []
     for q in qs:
-        raw.append({
-            "text": q.text,
-            "options": q.options,
-            "correct_id": q.correct_id,
-            "source_chat_id": q.source_chat_id,
-            "source_message_id": q.source_message_id,
-        })
+        raw.append(
+            {
+                "text": q.text,
+                "options": q.options,
+                "correct_id": q.correct_id,
+                "source_chat_id": q.source_chat_id,
+                "source_message_id": q.source_message_id,
+            }
+        )
     _save_json(QUESTIONS_FILE, raw)
 
-# load once
-QUESTION_BANK: List[Question] = load_question_bank()
+QUESTION_BANK: List[Question] = load_questions()
 
-# =================== AUTH HELPERS ===================
 
-async def is_owner(user_id: int) -> bool:
-    return user_id == get_owner_id()
+# =========================================================
+#  AUTH
+# =========================================================
+def is_internal_admin(user_id: int) -> bool:
+    return user_id == OWNER_ID or user_id in INTERNAL_ADMINS
 
-async def is_admin_or_owner(bot: Bot, chat_id: int, user_id: int) -> bool:
-    if await is_owner(user_id):
-        return True
+def unauthorized_text() -> str:
+    return f"⚠️ You are not allowed to use this bot.\nContact {CONTACT_OWNER_1} / {CONTACT_OWNER_2}"
+
+async def deny_and_warn(message: Message, bot: Bot, delete_in_group: bool = True):
     try:
-        member = await bot.get_chat_member(chat_id, user_id)
-        return member.status in ("administrator", "creator")
+        if delete_in_group and message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            await message.delete()
     except Exception:
-        return False
+        pass
+    try:
+        await bot.send_message(message.from_user.id, unauthorized_text())
+    except Exception:
+        pass
 
-def ensure_owner_claim_hint() -> str:
-    return (
-        "⚠️ Owner is not set yet.\n"
-        "Open bot inbox and send: /claim_owner\n"
-    )
 
-# =================== UI HELPERS ===================
+# =========================================================
+#  UTILS: Links
+# =========================================================
+def make_message_link(chat_id: int, msg_id: int, public_username: Optional[str]) -> str:
+    # public group: https://t.me/<username>/<msg_id>
+    if public_username:
+        return f"https://t.me/{public_username}/{msg_id}"
+    # private/supergroup: https://t.me/c/<internal>/<msg_id>
+    # internal id is chat_id without -100 prefix
+    if str(chat_id).startswith("-100"):
+        internal = str(chat_id)[4:]
+        return f"https://t.me/c/{internal}/{msg_id}"
+    # fallback
+    return ""
 
+
+# =========================================================
+#  UI helpers
+# =========================================================
 def kb_groups(page: int = 0, per_page: int = 6, prefix: str = "grp") -> InlineKeyboardMarkup:
-    groups = get_bound_groups()
+    groups = load_groups()
     items = list(groups.items())
     total = len(items)
     pages = max(1, (total + per_page - 1) // per_page)
     page = max(0, min(page, pages - 1))
     start = page * per_page
-    part = items[start:start + per_page]
+    part = items[start : start + per_page]
 
     rows = []
-    for chat_id, meta in part:
-        title = meta.get("title", chat_id)
-        rows.append([InlineKeyboardButton(text=title, callback_data=f"{prefix}:pick:{chat_id}")])
+    for gid, meta in part:
+        title = meta.get("title", gid)
+        rows.append([InlineKeyboardButton(text=title, callback_data=f"{prefix}:pick:{gid}")])
 
     nav = []
     if page > 0:
@@ -205,16 +283,14 @@ def kb_groups(page: int = 0, per_page: int = 6, prefix: str = "grp") -> InlineKe
     nav.append(InlineKeyboardButton(text=f"Page {page+1}/{pages}", callback_data="noop"))
     if page < pages - 1:
         nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"{prefix}:page:{page+1}"))
-
-    if nav:
-        rows.append(nav)
+    rows.append(nav)
 
     rows.append([InlineKeyboardButton(text="Close", callback_data=f"{prefix}:close")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_admin_panel(page: int = 0) -> InlineKeyboardMarkup:
+def kb_admin_panel() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text="📌 Groups (Start/Setup)", callback_data="panel:groups:0")],
+        [InlineKeyboardButton(text="📌 Groups", callback_data="panel:groups:0")],
         [InlineKeyboardButton(text="🧾 Question Count", callback_data="panel:qcount")],
         [InlineKeyboardButton(text="🧹 Clear Questions", callback_data="panel:qclear")],
         [InlineKeyboardButton(text="📣 Announcement", callback_data="panel:announce")],
@@ -222,188 +298,391 @@ def kb_admin_panel(page: int = 0) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_group_actions(chat_id: str) -> InlineKeyboardMarkup:
+def kb_group_actions(gid: str) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text="✅ Mark READY", callback_data=f"gact:ready:{chat_id}")],
-        [InlineKeyboardButton(text="📝 Set Exam Name", callback_data=f"gact:setname:{chat_id}")],
-        [InlineKeyboardButton(text="⏱ Set Time/Question", callback_data=f"gact:settime:{chat_id}")],
-        [InlineKeyboardButton(text="🎯 Set Marks (+/-)", callback_data=f"gact:setmarks:{chat_id}")],
-        [InlineKeyboardButton(text="🗓 Schedule Start", callback_data=f"gact:schedule:{chat_id}")],
-        [InlineKeyboardButton(text="🚀 Start Now", callback_data=f"gact:start:{chat_id}")],
+        [InlineKeyboardButton(text="✅ READY", callback_data=f"g:ready:{gid}")],
+        [InlineKeyboardButton(text="📝 Exam Name", callback_data=f"g:setname:{gid}")],
+        [InlineKeyboardButton(text="⏱ Time/Q", callback_data=f"g:settime:{gid}")],
+        [InlineKeyboardButton(text="🎯 Marks (+/-)", callback_data=f"g:setmarks:{gid}")],
+        [InlineKeyboardButton(text="🗓 Schedule", callback_data=f"g:schedule:{gid}")],
+        [InlineKeyboardButton(text="🚀 Start Now", callback_data=f"g:start:{gid}")],
         [InlineKeyboardButton(text="↩️ Back", callback_data="panel:groups:0")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_schedule(chat_id: str) -> InlineKeyboardMarkup:
+def kb_schedule(gid: str) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text="5 min", callback_data=f"sch:{chat_id}:5"),
-         InlineKeyboardButton(text="10 min", callback_data=f"sch:{chat_id}:10"),
-         InlineKeyboardButton(text="30 min", callback_data=f"sch:{chat_id}:30")],
-        [InlineKeyboardButton(text="1 hour", callback_data=f"sch:{chat_id}:60")],
-        [InlineKeyboardButton(text="Custom (type in DM)", callback_data=f"sch:{chat_id}:custom")],
-        [InlineKeyboardButton(text="↩️ Back", callback_data=f"gact:open:{chat_id}")],
+        [
+            InlineKeyboardButton(text="5 min", callback_data=f"sch:{gid}:5"),
+            InlineKeyboardButton(text="10 min", callback_data=f"sch:{gid}:10"),
+            InlineKeyboardButton(text="30 min", callback_data=f"sch:{gid}:30"),
+        ],
+        [InlineKeyboardButton(text="1 hour", callback_data=f"sch:{gid}:60")],
+        [InlineKeyboardButton(text="Custom (type)", callback_data=f"sch:{gid}:custom")],
+        [InlineKeyboardButton(text="↩️ Back", callback_data=f"g:open:{gid}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def preset_for(chat_id: str) -> ExamPreset:
-    presets = get_presets()
-    d = presets.get(chat_id) or {}
+def get_preset(gid: str) -> ExamPreset:
+    presets = load_presets()
+    d = presets.get(gid) or {}
     return ExamPreset(
         exam_name=d.get("exam_name", "Untitled Exam"),
-        time_per_q=int(d.get("time_per_q", TIME_PER_Q_DEFAULT)),
-        mark_per_q=float(d.get("mark_per_q", RIGHT_MARK_DEFAULT)),
-        negative_mark=float(d.get("negative_mark", NEGATIVE_DEFAULT)),
+        time_per_q=int(d.get("time_per_q", DEFAULT_TIME_PER_Q)),
+        mark_per_q=float(d.get("mark_per_q", DEFAULT_MARK_PER_Q)),
+        negative=float(d.get("negative", DEFAULT_NEGATIVE)),
         ready=bool(d.get("ready", False)),
     )
 
-def save_preset(chat_id: str, preset: ExamPreset) -> None:
-    presets = get_presets()
-    presets[chat_id] = {
-        "exam_name": preset.exam_name,
-        "time_per_q": preset.time_per_q,
-        "mark_per_q": preset.mark_per_q,
-        "negative_mark": preset.negative_mark,
-        "ready": preset.ready,
+def save_preset(gid: str, p: ExamPreset) -> None:
+    presets = load_presets()
+    presets[gid] = {
+        "exam_name": p.exam_name,
+        "time_per_q": p.time_per_q,
+        "mark_per_q": p.mark_per_q,
+        "negative": p.negative,
+        "ready": p.ready,
     }
     save_presets(presets)
 
-def format_preset(chat_id: str) -> str:
-    p = preset_for(chat_id)
+def preset_text(gid: str) -> str:
+    p = get_preset(gid)
     return (
-        f"📌 Group: `{chat_id}`\n"
-        f"🧪 Exam Name: {p.exam_name}\n"
-        f"⏱ Time/Question: {p.time_per_q}s\n"
-        f"✅ Mark/Question: +{p.mark_per_q}\n"
-        f"❌ Negative: -{p.negative_mark}\n"
-        f"🚦 READY: {'YES' if p.ready else 'NO'}\n"
-        f"📚 Questions: {len(QUESTION_BANK)}"
+        f"<b>Group:</b> <code>{gid}</code>\n"
+        f"<b>Exam:</b> {p.exam_name}\n"
+        f"<b>Time/Q:</b> {p.time_per_q}s\n"
+        f"<b>Mark/Q:</b> +{p.mark_per_q}\n"
+        f"<b>Negative:</b> -{p.negative}\n"
+        f"<b>READY:</b> {'YES' if p.ready else 'NO'}\n"
+        f"<b>Questions:</b> {len(QUESTION_BANK)}"
     )
 
-# ===================== BASIC COMMANDS =====================
 
+# =========================================================
+#  BASIC DM
+# =========================================================
 @router.message(Command("start"))
 async def cmd_start(message: Message):
-    txt = (
-        "👋 Advanced Exam Bot (aiogram v3)\n\n"
-        "First time setup:\n"
-        "1) DM me: /claim_owner\n"
-        "2) In your group: /bind_group\n"
-        "3) DM: send quiz polls or JSON file to add questions\n"
-        "4) DM: /admin_panel → setup group preset → READY\n"
-        "5) Group: /start_exam\n\n"
-        "DM Commands:\n"
-        "• /admin_panel\n"
-        "• /question_count\n"
-        "• /json_template\n"
-        "• /validate_json (reply to a JSON file)\n\n"
-        "Group Commands (owner/admin only):\n"
-        "• /bind_group\n"
-        "• /start_exam\n"
-        "• /stop_exam\n"
-    )
-    await message.answer(txt)
+    if message.chat.type != ChatType.PRIVATE:
+        return
 
-@router.message(Command("whoami"))
-async def cmd_whoami(message: Message):
-    u = message.from_user
-    if not u:
-        return
-    await message.answer(f"Your ID: `{u.id}`", parse_mode="Markdown")
+    if is_internal_admin(message.from_user.id):
+        text = (
+            "✅ <b>Extreme Exam Bot</b>"
+            "<b>Admin Panel</b>"
+            "• /admin_panel"
+            "• /question_count"
+            "• /json_template"
+            "• /validate_json (reply to JSON file)"
+            "• /announce /announce_pin (after sending content)"
+            "• /diagnose"
+            "<b>Group Commands</b> (Owner/Admin only)"
+            "• /bind_group"
+            "• /start_exam"
+            "• /stop_exam"
+        )
+    else:
+        text = (
+            "✅ <b>Extreme Exam Bot</b>"
+            "This bot is used by the exam owner/admin."
+            "You can participate in exams from the group."
+            "📩 To receive your full exam analysis in DM, please keep this chat open and send /start here (done)."
+            "⚠️ Other commands are not available for participants."
+            f"Contact {CONTACT_OWNER_1} / {CONTACT_OWNER_2}"
+        )
 
-@router.message(Command("claim_owner"), F.chat.type == ChatType.PRIVATE)
-async def cmd_claim_owner(message: Message):
-    u = message.from_user
-    if not u:
+    await message.answer(text)
+
+
+@router.message(F.chat.type == ChatType.PRIVATE, F.text.startswith("/"))
+async def participant_command_guard(message: Message, bot: Bot):
+    if is_internal_admin(message.from_user.id):
         return
-    current = get_owner_id()
-    if current and current != u.id:
-        await message.answer("❌ Owner already set. Only current owner can change it.")
+    # Allow only /start for participants
+    if message.text.strip().startswith("/start"):
         return
-    set_owner_id(u.id)
-    await message.answer("✅ You are now set as OWNER.\nOpen /admin_panel to manage everything.")
+    await message.answer(unauthorized_text())
 
 @router.message(Command("admin_panel"), F.chat.type == ChatType.PRIVATE)
 async def cmd_admin_panel(message: Message):
-    u = message.from_user
-    if not u:
+    if not is_internal_admin(message.from_user.id):
+        await message.answer(unauthorized_text())
         return
-    if get_owner_id() == 0:
-        await message.answer(ensure_owner_claim_hint())
-        return
-    # allow owner + admins of any bound group (practically owner only needed)
-    # we allow only owner for panel to keep simple
-    if not await is_owner(u.id):
-        await message.answer("❌ Only OWNER can use Admin Panel.")
-        return
-
-    await message.answer("⚙️ Admin Panel", reply_markup=kb_admin_panel())
+    await message.answer("⚙️ <b>Admin Panel</b>", reply_markup=kb_admin_panel())
 
 @router.message(Command("question_count"))
 async def cmd_question_count(message: Message):
-    await message.answer(f"📚 Saved Questions: {len(QUESTION_BANK)}")
+    if message.chat.type == ChatType.PRIVATE and not is_internal_admin(message.from_user.id):
+        await message.answer(unauthorized_text())
+        return
+    await message.answer(f"📚 Saved Questions: <b>{len(QUESTION_BANK)}</b>")
 
-@router.message(Command("clear_questions"), F.chat.type == ChatType.PRIVATE)
-async def cmd_clear_questions(message: Message):
-    u = message.from_user
-    if not u or not await is_owner(u.id):
-        await message.answer("❌ Only OWNER can clear questions.")
+@router.callback_query(F.data == "noop")
+async def cb_noop(call: CallbackQuery):
+    await call.answer()
+
+@router.callback_query(F.data == "panel:close")
+async def cb_panel_close(call: CallbackQuery):
+    try:
+        await call.message.edit_text("✅ Closed.")
+    except Exception:
+        pass
+    await call.answer()
+
+@router.callback_query(F.data.startswith("panel:groups:"))
+async def cb_panel_groups(call: CallbackQuery):
+    if not is_internal_admin(call.from_user.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    page = int(call.data.split(":")[-1])
+    await call.message.edit_text("📌 <b>Select a group</b>", reply_markup=kb_groups(page, prefix="grp"))
+    await call.answer()
+
+@router.callback_query(F.data == "panel:qcount")
+async def cb_panel_qcount(call: CallbackQuery):
+    if not is_internal_admin(call.from_user.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    await call.message.edit_text(f"📚 Saved Questions: <b>{len(QUESTION_BANK)}</b>", reply_markup=kb_admin_panel())
+    await call.answer()
+
+@router.callback_query(F.data == "panel:qclear")
+async def cb_panel_qclear(call: CallbackQuery):
+    if not is_internal_admin(call.from_user.id):
+        await call.answer("Not allowed", show_alert=True)
         return
     QUESTION_BANK.clear()
-    save_question_bank(QUESTION_BANK)
-    await message.answer("🧹 Question bank cleared.")
+    save_questions(QUESTION_BANK)
+    await call.message.edit_text("🧹 Question bank cleared.", reply_markup=kb_admin_panel())
+    await call.answer()
 
-# ===================== GROUP BIND =====================
+@router.callback_query(F.data == "panel:announce")
+async def cb_panel_announce(call: CallbackQuery):
+    if not is_internal_admin(call.from_user.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    txt = (
+        "📣 <b>Announcement</b>\n\n"
+        "1) Send me any content (text/photo/video/file).\n"
+        "2) Then type /announce or /announce_pin\n"
+        "3) Select a bound group → click → posted.\n"
+    )
+    await call.message.edit_text(txt, reply_markup=kb_admin_panel())
+    await call.answer()
 
-@router.message(Command("bind_group"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
-async def cmd_bind_group(message: Message, bot: Bot):
-    u = message.from_user
-    if not u:
+@router.callback_query(F.data.startswith("grp:page:"))
+async def cb_grp_page(call: CallbackQuery):
+    page = int(call.data.split(":")[-1])
+    await call.message.edit_reply_markup(reply_markup=kb_groups(page, prefix="grp"))
+    await call.answer()
+
+@router.callback_query(F.data == "grp:close")
+async def cb_grp_close(call: CallbackQuery):
+    try:
+        await call.message.edit_text("✅ Closed.")
+    except Exception:
+        pass
+    await call.answer()
+
+@router.callback_query(F.data.startswith("grp:pick:"))
+async def cb_grp_pick(call: CallbackQuery):
+    if not is_internal_admin(call.from_user.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    gid = call.data.split(":")[-1]
+    await call.message.edit_text(preset_text(gid), reply_markup=kb_group_actions(gid))
+    await call.answer()
+
+@router.callback_query(F.data.startswith("g:open:"))
+async def cb_g_open(call: CallbackQuery):
+    gid = call.data.split(":")[-1]
+    await call.message.edit_text(preset_text(gid), reply_markup=kb_group_actions(gid))
+    await call.answer()
+
+@router.callback_query(F.data.startswith("g:ready:"))
+async def cb_g_ready(call: CallbackQuery):
+    gid = call.data.split(":")[-1]
+    p = get_preset(gid)
+    p.ready = True
+    save_preset(gid, p)
+    await call.message.edit_text(preset_text(gid), reply_markup=kb_group_actions(gid))
+    await call.answer("READY ✅")
+
+@router.callback_query(F.data.startswith("g:setname:"))
+async def cb_g_setname(call: CallbackQuery):
+    gid = call.data.split(":")[-1]
+    WIZARD[call.from_user.id] = {"mode": "name", "gid": gid, "panel": (call.message.chat.id, call.message.message_id)}
+    await call.message.edit_text("📝 Send <b>Exam Name</b> now (type here).")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("g:settime:"))
+async def cb_g_settime(call: CallbackQuery):
+    gid = call.data.split(":")[-1]
+    WIZARD[call.from_user.id] = {"mode": "time", "gid": gid, "panel": (call.message.chat.id, call.message.message_id)}
+    await call.message.edit_text("⏱ Send <b>Time per question</b> in seconds (e.g., 30).")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("g:setmarks:"))
+async def cb_g_setmarks(call: CallbackQuery):
+    gid = call.data.split(":")[-1]
+    WIZARD[call.from_user.id] = {"mode": "marks", "gid": gid, "panel": (call.message.chat.id, call.message.message_id)}
+    await call.message.edit_text("🎯 Send marks as: <code>mark_per_q negative</code>\nExample: <code>1 0.25</code>")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("g:schedule:"))
+async def cb_g_schedule(call: CallbackQuery):
+    gid = call.data.split(":")[-1]
+    await call.message.edit_text("🗓 Choose schedule:", reply_markup=kb_schedule(gid))
+    await call.answer()
+
+@router.callback_query(F.data.startswith("sch:"))
+async def cb_schedule(call: CallbackQuery, bot: Bot):
+    _, gid, mins = call.data.split(":")
+    if mins == "custom":
+        WIZARD[call.from_user.id] = {"mode": "schedule_custom", "gid": gid, "panel": (call.message.chat.id, call.message.message_id)}
+        await call.message.edit_text("🗓 Send date-time: <code>YYYY-MM-DD HH:MM</code>\nTimezone: <b>Asia/Dhaka</b>")
+        await call.answer()
         return
 
-    # must be owner/admin of the group
-    if not await is_admin_or_owner(bot, message.chat.id, u.id):
+    minutes = int(mins)
+    run_at = datetime.now() + timedelta(minutes=minutes)
+    key = "scheduled_start"
+    old = SCHEDULE_TASKS.pop((int(gid), key), None)
+    if old:
+        old.cancel()
+
+    async def _job():
+        await asyncio.sleep(minutes * 60)
+        await start_exam_in_group(bot, int(gid), initiator_id=call.from_user.id, silent=True)
+
+    SCHEDULE_TASKS[(int(gid), key)] = asyncio.create_task(_job())
+    await call.message.edit_text(f"✅ Scheduled for <b>{run_at.strftime('%Y-%m-%d %H:%M')}</b>", reply_markup=kb_group_actions(gid))
+    await call.answer("Scheduled ✅")
+
+@router.callback_query(F.data.startswith("g:start:"))
+async def cb_g_start(call: CallbackQuery, bot: Bot):
+    gid = int(call.data.split(":")[-1])
+    ok, msg = await start_exam_in_group(bot, gid, initiator_id=call.from_user.id, silent=False)
+    await call.message.edit_text(msg, reply_markup=kb_admin_panel())
+    await call.answer()
+
+
+@router.message(F.chat.type == ChatType.PRIVATE, F.text)
+async def dm_wizard_text(message: Message, bot: Bot):
+    # cache last DM content too (text)
+    if is_internal_admin(message.from_user.id):
+        LAST_DM_CONTENT[message.from_user.id] = (message.chat.id, message.message_id)
+
+    st = WIZARD.get(message.from_user.id)
+    if not st:
+        return
+
+    mode = st["mode"]
+    gid = st["gid"]
+    panel_chat, panel_msg = st["panel"]
+
+    try:
+        p = get_preset(gid)
+        if mode == "name":
+            p.exam_name = message.text.strip()
+            p.ready = False
+            save_preset(gid, p)
+
+        elif mode == "time":
+            t = int(message.text.strip())
+            if t < 5 or t > 600:
+                await message.answer("❌ Time must be 5..600 seconds.")
+                return
+            p.time_per_q = t
+            p.ready = False
+            save_preset(gid, p)
+
+        elif mode == "marks":
+            parts = message.text.strip().split()
+            if len(parts) != 2:
+                await message.answer("❌ Format: <code>1 0.25</code>")
+                return
+            p.mark_per_q = float(parts[0])
+            p.negative = float(parts[1])
+            p.ready = False
+            save_preset(gid, p)
+
+        elif mode == "schedule_custom":
+            dt = datetime.strptime(message.text.strip(), "%Y-%m-%d %H:%M")
+            if dt <= datetime.now():
+                await message.answer("❌ Time must be in the future.")
+                return
+            delay = int((dt - datetime.now()).total_seconds())
+            key = "scheduled_start"
+            old = SCHEDULE_TASKS.pop((int(gid), key), None)
+            if old:
+                old.cancel()
+
+            async def _job():
+                await asyncio.sleep(delay)
+                await start_exam_in_group(bot, int(gid), initiator_id=message.from_user.id, silent=True)
+
+            SCHEDULE_TASKS[(int(gid), key)] = asyncio.create_task(_job())
+
+        WIZARD.pop(message.from_user.id, None)
+
+        # edit same panel message
         try:
-            await message.delete()
+            await bot.edit_message_text(
+                chat_id=panel_chat,
+                message_id=panel_msg,
+                text=preset_text(gid),
+                reply_markup=kb_group_actions(gid),
+            )
         except Exception:
             pass
-        await bot.send_message(
-            u.id,
-            "⚠️ You are not allowed to use this command.\nContact: @Your_Himus / @Probaho_Robot"
-        )
+
+        await message.answer("✅ Saved & panel updated.")
+
+    except Exception as e:
+        WIZARD.pop(message.from_user.id, None)
+        await message.answer(f"❌ Error: {e}")
+
+
+# =========================================================
+#  GROUP BIND
+# =========================================================
+@router.message(Command("bind_group"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def cmd_bind_group(message: Message, bot: Bot):
+    if not is_internal_admin(message.from_user.id):
+        await deny_and_warn(message, bot, delete_in_group=True)
         return
 
-    groups = get_bound_groups()
-    cid = str(message.chat.id)
-    groups[cid] = {
-        "title": message.chat.title or cid,
+    groups = load_groups()
+    gid = str(message.chat.id)
+    groups[gid] = {
+        "title": message.chat.title or gid,
         "type": message.chat.type,
-        "bound_at": datetime.utcnow().isoformat()
+        "bound_at": datetime.utcnow().isoformat(),
+        "public_username": (await bot.get_chat(message.chat.id)).username,
     }
-    save_bound_groups(groups)
+    save_groups(groups)
 
     # ensure preset exists
-    p = preset_for(cid)
-    save_preset(cid, p)
+    p = get_preset(gid)
+    save_preset(gid, p)
 
     try:
         await message.delete()
     except Exception:
         pass
+    try:
+        await bot.send_message(message.from_user.id, f"✅ Group bound: <b>{message.chat.title}</b>")
+    except Exception:
+        pass
 
-    await bot.send_message(u.id, f"✅ Group bound: {message.chat.title}\nNow open /admin_panel → Groups → Setup → READY")
 
-# ===================== QUESTIONS: QUIZ POLL (DM) =====================
-
-@router.message(F.poll, F.chat.type == ChatType.PRIVATE)
-async def handle_quiz_poll_in_dm(message: Message):
-    u = message.from_user
-    if not u:
-        return
-    if get_owner_id() == 0:
-        await message.answer(ensure_owner_claim_hint())
-        return
-    if not await is_owner(u.id):
-        await message.answer("❌ Only OWNER can add questions.")
+# =========================================================
+#  QUESTIONS: DM QUIZ POLL
+# =========================================================
+@router.message(F.chat.type == ChatType.PRIVATE, F.poll)
+async def dm_quiz_poll(message: Message):
+    if not is_internal_admin(message.from_user.id):
         return
 
     poll = message.poll
@@ -411,26 +690,24 @@ async def handle_quiz_poll_in_dm(message: Message):
         await message.answer("❌ Only QUIZ polls with correct answer can be saved.")
         return
 
-    options = [o.text for o in poll.options]
     q = Question(
         text=poll.question,
-        options=options,
+        options=[o.text for o in poll.options],
         correct_id=int(poll.correct_option_id),
-        source_chat_id=message.chat.id,
-        source_message_id=message.message_id
     )
     QUESTION_BANK.append(q)
-    save_question_bank(QUESTION_BANK)
+    save_questions(QUESTION_BANK)
+    await message.answer(f"✅ Question saved. Total: <b>{len(QUESTION_BANK)}</b>")
 
-    await message.answer(f"✅ Saved question.\nTotal: {len(QUESTION_BANK)}")
 
-# ===================== QUESTIONS: JSON IMPORT (DM) =====================
-
+# =========================================================
+#  QUESTIONS: JSON import + validator
+# =========================================================
 def validate_json_questions(obj: Any) -> Tuple[bool, str, List[Question]]:
     """
-    Expected format:
+    Expected:
     [
-      {"question":"...", "options":{"A":"..","B":"..","C":"..","D":".."}, "correct_answer":"A"}
+      {"question":"...", "options":{"A":"..","B":"..","C":"..","D":".."}, "correct_answer":"A", ...}
     ]
     """
     if not isinstance(obj, list):
@@ -451,46 +728,10 @@ def validate_json_questions(obj: Any) -> Tuple[bool, str, List[Question]]:
                 return False, f"Item #{i}: options must include '{k}' as string.", []
         if ca not in ["A", "B", "C", "D"]:
             return False, f"Item #{i}: 'correct_answer' must be one of A/B/C/D.", []
-
         options_list = [opts["A"], opts["B"], opts["C"], opts["D"]]
         correct_id = ["A", "B", "C", "D"].index(ca)
         out.append(Question(text=qtext.strip(), options=options_list, correct_id=correct_id))
     return True, f"✅ Valid JSON. Questions: {len(out)}", out
-
-@router.message(F.document, F.chat.type == ChatType.PRIVATE)
-async def handle_json_file_dm(message: Message, bot: Bot):
-    u = message.from_user
-    if not u:
-        return
-    if get_owner_id() == 0:
-        await message.answer(ensure_owner_claim_hint())
-        return
-    if not await is_owner(u.id):
-        await message.answer("❌ Only OWNER can import JSON.")
-        return
-
-    doc = message.document
-    if not doc.file_name or not doc.file_name.lower().endswith(".json"):
-        return  # ignore other files
-
-    file = await bot.get_file(doc.file_id)
-    data = await bot.download_file(file.file_path)
-    raw = data.read()
-
-    try:
-        obj = json.loads(raw.decode("utf-8"))
-    except Exception:
-        await message.answer("❌ Invalid JSON (decode/parse failed).")
-        return
-
-    ok, msg, questions = validate_json_questions(obj)
-    if not ok:
-        await message.answer(f"❌ JSON Validation Failed:\n{msg}")
-        return
-
-    QUESTION_BANK.extend(questions)
-    save_question_bank(QUESTION_BANK)
-    await message.answer(f"✅ Imported successfully.\nNow total questions: {len(QUESTION_BANK)}")
 
 @router.message(Command("json_template"), F.chat.type == ChatType.PRIVATE)
 async def cmd_json_template(message: Message):
@@ -499,319 +740,113 @@ async def cmd_json_template(message: Message):
             "question": "What is the capital of France?",
             "options": {"A": "Paris", "B": "London", "C": "Rome", "D": "Berlin"},
             "correct_answer": "A",
-            "explanation": "Paris is the capital of France."
+            "explanation": "Optional"
         }
     ]
-    await message.answer("📄 JSON Template (example):\n\n" + json.dumps(tpl, ensure_ascii=False, indent=2))
+    await message.answer("<b>JSON Template</b>\n\n<pre>" + json.dumps(tpl, ensure_ascii=False, indent=2) + "</pre>")
 
 @router.message(Command("validate_json"), F.chat.type == ChatType.PRIVATE)
 async def cmd_validate_json(message: Message, bot: Bot):
-    u = message.from_user
-    if not u:
+    if not is_internal_admin(message.from_user.id):
         return
     if not message.reply_to_message or not message.reply_to_message.document:
         await message.answer("Reply to a .json file with /validate_json")
         return
-
     doc = message.reply_to_message.document
     if not doc.file_name or not doc.file_name.lower().endswith(".json"):
-        await message.answer("❌ That replied file is not .json")
+        await message.answer("❌ Replied file is not .json")
         return
-
     file = await bot.get_file(doc.file_id)
     data = await bot.download_file(file.file_path)
     raw = data.read()
-
     try:
         obj = json.loads(raw.decode("utf-8"))
     except Exception:
         await message.answer("❌ Invalid JSON (parse failed).")
         return
-
     ok, msg, _ = validate_json_questions(obj)
     await message.answer(msg if ok else f"❌ {msg}")
 
-# ===================== ADMIN PANEL CALLBACKS =====================
-
-@router.callback_query(F.data == "noop")
-async def cb_noop(call: CallbackQuery):
-    await call.answer()
-
-@router.callback_query(F.data == "panel:close")
-async def cb_panel_close(call: CallbackQuery):
+@router.message(F.chat.type == ChatType.PRIVATE, F.document)
+async def dm_json_import(message: Message, bot: Bot):
+    if not is_internal_admin(message.from_user.id):
+        return
+    doc = message.document
+    if not doc.file_name or not doc.file_name.lower().endswith(".json"):
+        return
+    file = await bot.get_file(doc.file_id)
+    data = await bot.download_file(file.file_path)
+    raw = data.read()
     try:
-        await call.message.edit_text("✅ Closed.")
+        obj = json.loads(raw.decode("utf-8"))
     except Exception:
-        pass
-    await call.answer()
-
-@router.callback_query(F.data.startswith("panel:groups:"))
-async def cb_panel_groups(call: CallbackQuery):
-    u = call.from_user
-    if not u or not await is_owner(u.id):
-        await call.answer("Not allowed", show_alert=True)
+        await message.answer("❌ Invalid JSON (parse failed).")
         return
-    page = int(call.data.split(":")[-1])
-    await call.message.edit_text("📌 Select a group:", reply_markup=kb_groups(page, prefix="grp"))
-    await call.answer()
-
-@router.callback_query(F.data == "panel:qcount")
-async def cb_panel_qcount(call: CallbackQuery):
-    u = call.from_user
-    if not u or not await is_owner(u.id):
-        await call.answer("Not allowed", show_alert=True)
+    ok, msg, questions = validate_json_questions(obj)
+    if not ok:
+        await message.answer(f"❌ JSON Validation Failed:\n{msg}")
         return
-    await call.message.edit_text(f"📚 Saved Questions: {len(QUESTION_BANK)}", reply_markup=kb_admin_panel())
-    await call.answer()
+    QUESTION_BANK.extend(questions)
+    save_questions(QUESTION_BANK)
+    await message.answer(f"✅ Imported. Total questions: <b>{len(QUESTION_BANK)}</b>")
 
-@router.callback_query(F.data == "panel:qclear")
-async def cb_panel_qclear(call: CallbackQuery):
-    u = call.from_user
-    if not u or not await is_owner(u.id):
-        await call.answer("Not allowed", show_alert=True)
+
+# =========================================================
+#  ANNOUNCEMENT (DM: content -> /announce -> pick group)
+# =========================================================
+@router.message(F.chat.type == ChatType.PRIVATE)
+async def cache_any_dm_content(message: Message):
+    # Cache last DM content for internal admins only (any type)
+    if not is_internal_admin(message.from_user.id):
         return
-    QUESTION_BANK.clear()
-    save_question_bank(QUESTION_BANK)
-    await call.message.edit_text("🧹 Question bank cleared.", reply_markup=kb_admin_panel())
-    await call.answer()
-
-@router.callback_query(F.data == "panel:announce")
-async def cb_panel_announce(call: CallbackQuery):
-    u = call.from_user
-    if not u or not await is_owner(u.id):
-        await call.answer("Not allowed", show_alert=True)
+    # Ignore commands; content only
+    if message.text and message.text.startswith("/"):
         return
-    txt = (
-        "📣 Announcement mode:\n\n"
-        "1) Send me ANY content (text/photo/video/file).\n"
-        "2) Reply to that message with /announce or /announce_pin.\n"
-        "3) I will show bound group list → click to post.\n"
-    )
-    await call.message.edit_text(txt, reply_markup=kb_admin_panel())
-    await call.answer()
-
-# ---------- group list pagination ----------
-@router.callback_query(F.data.startswith("grp:page:"))
-async def cb_grp_page(call: CallbackQuery):
-    page = int(call.data.split(":")[-1])
-    await call.message.edit_reply_markup(reply_markup=kb_groups(page, prefix="grp"))
-    await call.answer()
-
-@router.callback_query(F.data == "grp:close")
-async def cb_grp_close(call: CallbackQuery):
-    try:
-        await call.message.edit_text("✅ Closed.")
-    except Exception:
-        pass
-    await call.answer()
-
-@router.callback_query(F.data.startswith("grp:pick:"))
-async def cb_grp_pick(call: CallbackQuery):
-    u = call.from_user
-    if not u or not await is_owner(u.id):
-        await call.answer("Not allowed", show_alert=True)
-        return
-    chat_id = call.data.split(":")[-1]
-    await call.message.edit_text(format_preset(chat_id), reply_markup=kb_group_actions(chat_id), parse_mode="Markdown")
-    await call.answer()
-
-@router.callback_query(F.data.startswith("gact:open:"))
-async def cb_gact_open(call: CallbackQuery):
-    chat_id = call.data.split(":")[-1]
-    await call.message.edit_text(format_preset(chat_id), reply_markup=kb_group_actions(chat_id), parse_mode="Markdown")
-    await call.answer()
-
-@router.callback_query(F.data.startswith("gact:ready:"))
-async def cb_gact_ready(call: CallbackQuery):
-    chat_id = call.data.split(":")[-1]
-    p = preset_for(chat_id)
-    p.ready = True
-    save_preset(chat_id, p)
-    await call.message.edit_text(format_preset(chat_id), reply_markup=kb_group_actions(chat_id), parse_mode="Markdown")
-    await call.answer("READY ✅")
-
-@router.callback_query(F.data.startswith("gact:setname:"))
-async def cb_gact_setname(call: CallbackQuery):
-    chat_id = call.data.split(":")[-1]
-    WIZARD_STATE[call.from_user.id] = {"mode": "setname", "chat_id": chat_id, "panel_msg": (call.message.chat.id, call.message.message_id)}
-    await call.answer()
-    await call.message.edit_text("📝 Send exam name in this DM (just type).", reply_markup=None)
-
-@router.callback_query(F.data.startswith("gact:settime:"))
-async def cb_gact_settime(call: CallbackQuery):
-    chat_id = call.data.split(":")[-1]
-    WIZARD_STATE[call.from_user.id] = {"mode": "settime", "chat_id": chat_id, "panel_msg": (call.message.chat.id, call.message.message_id)}
-    await call.answer()
-    await call.message.edit_text("⏱ Send time per question in seconds (e.g., 30).", reply_markup=None)
-
-@router.callback_query(F.data.startswith("gact:setmarks:"))
-async def cb_gact_setmarks(call: CallbackQuery):
-    chat_id = call.data.split(":")[-1]
-    WIZARD_STATE[call.from_user.id] = {"mode": "setmarks", "chat_id": chat_id, "panel_msg": (call.message.chat.id, call.message.message_id)}
-    await call.answer()
-    await call.message.edit_text("🎯 Send marks format: +mark -negative\nExample: 1 0.25", reply_markup=None)
-
-@router.callback_query(F.data.startswith("gact:schedule:"))
-async def cb_gact_schedule(call: CallbackQuery):
-    chat_id = call.data.split(":")[-1]
-    await call.message.edit_text("🗓 Choose schedule:", reply_markup=kb_schedule(chat_id))
-    await call.answer()
-
-@router.callback_query(F.data.startswith("sch:"))
-async def cb_schedule_pick(call: CallbackQuery, bot: Bot):
-    # sch:<chat_id>:<minutes or custom>
-    _, chat_id, mins = call.data.split(":")
-    if mins == "custom":
-        WIZARD_STATE[call.from_user.id] = {"mode": "schedule_custom", "chat_id": chat_id, "panel_msg": (call.message.chat.id, call.message.message_id)}
-        await call.message.edit_text("🗓 Send date-time in format: YYYY-MM-DD HH:MM\nTimezone: Asia/Dhaka", reply_markup=None)
-        await call.answer()
-        return
-
-    minutes = int(mins)
-    run_at = datetime.now() + timedelta(minutes=minutes)
-    key = f"scheduled:{chat_id}"
-    # cancel previous
-    t = SCHEDULE_TASKS.pop((int(chat_id), key), None)
-    if t:
-        t.cancel()
-
-    async def _job():
-        await asyncio.sleep(minutes * 60)
-        await start_exam_in_group(bot, int(chat_id), initiator_id=call.from_user.id)
-
-    SCHEDULE_TASKS[(int(chat_id), key)] = asyncio.create_task(_job())
-    await call.message.edit_text(f"✅ Scheduled in {minutes} minutes.\n(At: {run_at.strftime('%Y-%m-%d %H:%M')})",
-                                reply_markup=kb_group_actions(chat_id))
-    await call.answer("Scheduled ✅")
-
-@router.callback_query(F.data.startswith("gact:start:"))
-async def cb_gact_start(call: CallbackQuery, bot: Bot):
-    chat_id = int(call.data.split(":")[-1])
-    await call.answer("Starting...")
-    ok, msg = await start_exam_in_group(bot, chat_id, initiator_id=call.from_user.id)
-    await call.message.edit_text(msg, reply_markup=kb_admin_panel())
-
-# ===================== WIZARD INPUT HANDLER (DM TEXT) =====================
-
-@router.message(F.text, F.chat.type == ChatType.PRIVATE)
-async def handle_wizard_text(message: Message):
-    u = message.from_user
-    if not u:
-        return
-    st = WIZARD_STATE.get(u.id)
-    if not st:
-        return  # normal text ignored
-
-    mode = st.get("mode")
-    chat_id = st.get("chat_id")
-    panel = st.get("panel_msg")
-    if not chat_id or not panel:
-        WIZARD_STATE.pop(u.id, None)
-        return
-
-    try:
-        if mode == "setname":
-            name = message.text.strip()
-            p = preset_for(chat_id)
-            p.exam_name = name
-            p.ready = False
-            save_preset(chat_id, p)
-
-        elif mode == "settime":
-            t = int(message.text.strip())
-            if t < 5 or t > 600:
-                await message.answer("❌ Time must be between 5 and 600 seconds.")
-                return
-            p = preset_for(chat_id)
-            p.time_per_q = t
-            p.ready = False
-            save_preset(chat_id, p)
-
-        elif mode == "setmarks":
-            parts = message.text.strip().split()
-            if len(parts) != 2:
-                await message.answer("❌ Format must be: <mark_per_q> <negative>  e.g., 1 0.25")
-                return
-            mpq = float(parts[0])
-            neg = float(parts[1])
-            if mpq <= 0 or neg < 0:
-                await message.answer("❌ Invalid values.")
-                return
-            p = preset_for(chat_id)
-            p.mark_per_q = mpq
-            p.negative_mark = neg
-            p.ready = False
-            save_preset(chat_id, p)
-
-        elif mode == "schedule_custom":
-            # YYYY-MM-DD HH:MM
-            dt = datetime.strptime(message.text.strip(), "%Y-%m-%d %H:%M")
-            now = datetime.now()
-            if dt <= now:
-                await message.answer("❌ Time must be in the future.")
-                return
-            delay = int((dt - now).total_seconds())
-            key = f"scheduled:{chat_id}"
-
-            # cancel previous
-            t = SCHEDULE_TASKS.pop((int(chat_id), key), None)
-            if t:
-                t.cancel()
-
-            async def _job():
-                await asyncio.sleep(delay)
-                await start_exam_in_group(message.bot, int(chat_id), initiator_id=u.id)
-
-            SCHEDULE_TASKS[(int(chat_id), key)] = asyncio.create_task(_job())
-
-        else:
-            pass
-
-        # update the same panel message (edit)
-        WIZARD_STATE.pop(u.id, None)
-        try:
-            await message.bot.edit_message_text(
-                chat_id=panel[0],
-                message_id=panel[1],
-                text=format_preset(chat_id),
-                reply_markup=kb_group_actions(chat_id),
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-
-        await message.answer("✅ Saved. Panel updated.")
-
-    except Exception as e:
-        WIZARD_STATE.pop(u.id, None)
-        await message.answer(f"❌ Error: {e}")
-
-# ===================== ANNOUNCEMENT (DM REPLY COMMAND) =====================
+    LAST_DM_CONTENT[message.from_user.id] = (message.chat.id, message.message_id)
 
 @router.message(Command("announce"), F.chat.type == ChatType.PRIVATE)
 async def cmd_announce(message: Message):
-    u = message.from_user
-    if not u or not await is_owner(u.id):
-        await message.answer("❌ Only OWNER can announce.")
-        return
-    if not message.reply_to_message:
-        await message.answer("Reply to a content message (photo/video/file/text) with /announce")
+    if not is_internal_admin(message.from_user.id):
+        await message.answer(unauthorized_text())
         return
 
-    # store draft reference
-    ANNOUNCE_DRAFT[u.id] = (message.reply_to_message.chat.id, message.reply_to_message.message_id)
-    await message.answer("📣 Select a group to post:", reply_markup=kb_groups(0, prefix="ann"))
+    # Prefer reply draft; else last DM content
+    if message.reply_to_message:
+        ANNOUNCE_DRAFT[message.from_user.id] = (message.reply_to_message.chat.id, message.reply_to_message.message_id)
+    else:
+        draft = LAST_DM_CONTENT.get(message.from_user.id)
+        if not draft:
+            await message.answer("❌ Send content first (text/photo/video/file), then type /announce.")
+            return
+        ANNOUNCE_DRAFT[message.from_user.id] = draft
+
+    groups = load_groups()
+    if not groups:
+        await message.answer("❌ No bound groups. Bind a group first: /bind_group (in group).")
+        return
+
+    await message.answer("📣 Select a group:", reply_markup=kb_groups(0, prefix="ann"))
 
 @router.message(Command("announce_pin"), F.chat.type == ChatType.PRIVATE)
 async def cmd_announce_pin(message: Message):
-    u = message.from_user
-    if not u or not await is_owner(u.id):
-        await message.answer("❌ Only OWNER can announce.")
+    if not is_internal_admin(message.from_user.id):
+        await message.answer(unauthorized_text())
         return
-    if not message.reply_to_message:
-        await message.answer("Reply to a content message with /announce_pin")
+
+    if message.reply_to_message:
+        ANNOUNCE_DRAFT[message.from_user.id] = (message.reply_to_message.chat.id, message.reply_to_message.message_id)
+    else:
+        draft = LAST_DM_CONTENT.get(message.from_user.id)
+        if not draft:
+            await message.answer("❌ Send content first (text/photo/video/file), then type /announce_pin.")
+            return
+        ANNOUNCE_DRAFT[message.from_user.id] = draft
+
+    groups = load_groups()
+    if not groups:
+        await message.answer("❌ No bound groups. Bind a group first: /bind_group (in group).")
         return
-    ANNOUNCE_DRAFT[u.id] = (message.reply_to_message.chat.id, message.reply_to_message.message_id)
+
     await message.answer("📌 Select a group to post & pin:", reply_markup=kb_groups(0, prefix="annpin"))
 
 @router.callback_query(F.data.startswith("ann:page:"))
@@ -824,43 +859,6 @@ async def cb_ann_page(call: CallbackQuery):
 async def cb_annpin_page(call: CallbackQuery):
     page = int(call.data.split(":")[-1])
     await call.message.edit_reply_markup(reply_markup=kb_groups(page, prefix="annpin"))
-    await call.answer()
-
-@router.callback_query(F.data.startswith("ann:pick:"))
-async def cb_ann_pick(call: CallbackQuery, bot: Bot):
-    u = call.from_user
-    draft = ANNOUNCE_DRAFT.get(u.id)
-    if not draft:
-        await call.answer("No draft found. Reply /announce again.", show_alert=True)
-        return
-    group_id = int(call.data.split(":")[-1])
-    src_chat, src_msg = draft
-    try:
-        await bot.copy_message(chat_id=group_id, from_chat_id=src_chat, message_id=src_msg)
-        await call.message.edit_text("✅ Posted successfully.")
-    except Exception as e:
-        await call.message.edit_text(f"❌ Failed: {e}")
-    await call.answer()
-
-@router.callback_query(F.data.startswith("annpin:pick:"))
-async def cb_annpin_pick(call: CallbackQuery, bot: Bot):
-    u = call.from_user
-    draft = ANNOUNCE_DRAFT.get(u.id)
-    if not draft:
-        await call.answer("No draft found. Reply /announce_pin again.", show_alert=True)
-        return
-    group_id = int(call.data.split(":")[-1])
-    src_chat, src_msg = draft
-    try:
-        sent = await bot.copy_message(chat_id=group_id, from_chat_id=src_chat, message_id=src_msg)
-        # try pin
-        try:
-            await bot.pin_chat_message(chat_id=group_id, message_id=sent.message_id)
-        except Exception:
-            pass
-        await call.message.edit_text("✅ Posted (pin attempted).")
-    except Exception as e:
-        await call.message.edit_text(f"❌ Failed: {e}")
     await call.answer()
 
 @router.callback_query(F.data == "ann:close")
@@ -879,176 +877,254 @@ async def cb_annpin_close(call: CallbackQuery):
         pass
     await call.answer()
 
-# ===================== EXAM COMMANDS (GROUP) =====================
+@router.callback_query(F.data.startswith("ann:pick:"))
+async def cb_ann_pick(call: CallbackQuery, bot: Bot):
+    if not is_internal_admin(call.from_user.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    draft = ANNOUNCE_DRAFT.get(call.from_user.id)
+    if not draft:
+        await call.answer("No draft. Send content then /announce.", show_alert=True)
+        return
+    gid = int(call.data.split(":")[-1])
+    src_chat, src_msg = draft
+    try:
+        await bot.copy_message(chat_id=gid, from_chat_id=src_chat, message_id=src_msg)
+        await call.message.edit_text("✅ Posted.")
+    except Exception as e:
+        await call.message.edit_text(f"❌ Failed: {e}")
+    await call.answer()
 
-async def start_exam_in_group(bot: Bot, chat_id: int, initiator_id: int) -> Tuple[bool, str]:
-    # validate questions
+@router.callback_query(F.data.startswith("annpin:pick:"))
+async def cb_annpin_pick(call: CallbackQuery, bot: Bot):
+    if not is_internal_admin(call.from_user.id):
+        await call.answer("Not allowed", show_alert=True)
+        return
+    draft = ANNOUNCE_DRAFT.get(call.from_user.id)
+    if not draft:
+        await call.answer("No draft. Send content then /announce_pin.", show_alert=True)
+        return
+    gid = int(call.data.split(":")[-1])
+    src_chat, src_msg = draft
+    try:
+        sent = await bot.copy_message(chat_id=gid, from_chat_id=src_chat, message_id=src_msg)
+        try:
+            await bot.pin_chat_message(chat_id=gid, message_id=sent.message_id)
+        except Exception:
+            pass
+        await call.message.edit_text("✅ Posted (pin attempted).")
+    except Exception as e:
+        await call.message.edit_text(f"❌ Failed: {e}")
+    await call.answer()
+
+
+# =========================================================
+#  GROUP: pin service cleanup (delete 'pinned a message' service message)
+# =========================================================
+
+@router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.pinned_message)
+async def cleanup_pin_service(message: Message):
+    session = EXAMS.get(message.chat.id)
+    if not session or not session.pin_cleanup_until:
+        return
+    if datetime.utcnow() <= session.pin_cleanup_until:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+
+# =========================================================
+#  GROUP: command lock for non-admin users
+# =========================================================
+@router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def group_lock(message: Message, bot: Bot):
+    session = EXAMS.get(message.chat.id)
+    if not session or not session.active:
+        return
+    if not message.from_user:
+        return
+
+    if is_internal_admin(message.from_user.id):
+        return
+
+    # Delete everything
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # Warning DM
+    try:
+        await bot.send_message(message.from_user.id, unauthorized_text())
+    except Exception:
+        pass
+
+
+# =========================================================
+#  GROUP: start/stop exam (Owner/Admin only)
+# =========================================================
+async def start_exam_in_group(bot: Bot, chat_id: int, initiator_id: int, silent: bool) -> Tuple[bool, str]:
     if not QUESTION_BANK:
-        return False, "❌ No questions saved. Add quiz polls or JSON in bot DM."
+        return False, "❌ No questions available. Add QUIZ polls or JSON in bot DM first."
 
-    cid = str(chat_id)
-    p = preset_for(cid)
+    gid = str(chat_id)
+    p = get_preset(gid)
     if not p.ready:
-        return False, "❌ Preset is NOT READY.\nOpen bot DM → /admin_panel → Groups → Setup → READY."
+        return False, "❌ Preset is NOT READY. Open bot DM → /admin_panel → Groups → Setup → READY"
 
-    # block if already active
     if chat_id in EXAMS and EXAMS[chat_id].active:
         return False, "⚠️ Exam already running."
 
     session = ExamSession(
         chat_id=chat_id,
-        questions=list(QUESTION_BANK),
         exam_name=p.exam_name,
-        time_per_question=p.time_per_q,
+        time_per_q=p.time_per_q,
         mark_per_q=p.mark_per_q,
-        negative_mark=p.negative_mark,
+        negative=p.negative,
+        questions=[Question(q.text, q.options, q.correct_id) for q in QUESTION_BANK],
         active=True,
-        admin_id=initiator_id,
-        started_at=datetime.utcnow()
     )
     EXAMS[chat_id] = session
 
-    await bot.send_message(
-        chat_id,
-        f"📝 Exam Started: {session.exam_name}\n\n"
-        f"Total Questions: {len(session.questions)}\n"
-        f"Time/Question: {session.time_per_question}s\n"
-        f"Mark: +{session.mark_per_q}\n"
-        f"Negative: -{session.negative_mark}\n\n"
-        "⚠️ During exam, messages are locked for non-admins."
-    )
-    asyncio.create_task(run_exam(session, bot))
+    async def _start_sequence():
+        # Intro message (will be pinned) + 5s countdown (edits same message)
+        try:
+            intro = await bot.send_message(
+                chat_id,
+                f"📝 <b>{session.exam_name}</b>"
+                f"Questions: <b>{len(session.questions)}</b> | Time/Q: <b>{session.time_per_q}s</b> | "
+                f"Mark: <b>+{session.mark_per_q}</b> | Negative: <b>-{session.negative}</b>"
+                f"⏳ Starting in <b>5</b> seconds..."
+            )
+            session.intro_message_id = intro.message_id
+
+            for i in range(4, 0, -1):
+                await asyncio.sleep(1)
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=intro.message_id,
+                        text=(
+                            f"📝 <b>{session.exam_name}</b>"
+                            f"Questions: <b>{len(session.questions)}</b> | Time/Q: <b>{session.time_per_q}s</b> | "
+                            f"Mark: <b>+{session.mark_per_q}</b> | Negative: <b>-{session.negative}</b>"
+                            f"⏳ Starting in <b>{i}</b> seconds..."
+                        ),
+                    )
+                except Exception:
+                    pass
+
+            # Pin intro message, then delete the service 'pinned a message'
+            try:
+                session.pin_cleanup_until = datetime.utcnow() + timedelta(seconds=15)
+                await bot.pin_chat_message(chat_id=chat_id, message_id=intro.message_id, disable_notification=True)
+            except Exception:
+                pass
+
+            # Start questions
+            await asyncio.sleep(1)
+        except Exception:
+            pass
+
+        asyncio.create_task(run_exam(bot, session))
+
+    # If silent schedule start: still run sequence but no extra spam beyond pinned intro
+    asyncio.create_task(_start_sequence())
     return True, "✅ Exam started."
 
 @router.message(Command("start_exam"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
-async def cmd_start_exam_group(message: Message, bot: Bot, command: CommandObject):
-    u = message.from_user
-    if not u:
-        return
-    if not await is_admin_or_owner(bot, message.chat.id, u.id):
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        await bot.send_message(u.id, "⚠️ Not allowed. Contact: @Your_Himus / @Probaho_Robot")
+async def cmd_start_exam(message: Message, bot: Bot, command: CommandObject):
+    if not is_internal_admin(message.from_user.id):
+        await deny_and_warn(message, bot, delete_in_group=True)
         return
 
-    # allow override: /start_exam "Name" 30 1 0.25
-    args = command.args or ""
-    if args.strip():
-        # very simple parser: name inside quotes optional
+    # Delete command message for clean group
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # Optional override: /start_exam "Name" 30 1 0.25
+    args = (command.args or "").strip()
+    if args:
         name = None
-        rest = args.strip()
+        rest = args
         if rest.startswith('"') and '"' in rest[1:]:
             end = rest[1:].index('"') + 1
             name = rest[1:end]
             rest = rest[end+1:].strip()
         parts = rest.split()
         try:
-            t = int(parts[0]) if len(parts) >= 1 else TIME_PER_Q_DEFAULT
-            mpq = float(parts[1]) if len(parts) >= 2 else RIGHT_MARK_DEFAULT
-            neg = float(parts[2]) if len(parts) >= 3 else NEGATIVE_DEFAULT
+            t = int(parts[0]) if len(parts) >= 1 else DEFAULT_TIME_PER_Q
+            mpq = float(parts[1]) if len(parts) >= 2 else DEFAULT_MARK_PER_Q
+            neg = float(parts[2]) if len(parts) >= 3 else DEFAULT_NEGATIVE
         except Exception:
-            await message.answer("❌ Invalid args. Example: /start_exam \"English Model Test\" 30 1 0.25")
+            await bot.send_message(message.from_user.id, "❌ Invalid args. Example: /start_exam \"English Model Test\" 30 1 0.25")
             return
 
-        cid = str(message.chat.id)
-        p = preset_for(cid)
+        gid = str(message.chat.id)
+        p = get_preset(gid)
         if name:
             p.exam_name = name
         p.time_per_q = t
         p.mark_per_q = mpq
-        p.negative_mark = neg
+        p.negative = neg
         p.ready = True
-        save_preset(cid, p)
+        save_preset(gid, p)
 
-    ok, msg = await start_exam_in_group(bot, message.chat.id, u.id)
+    ok, _ = await start_exam_in_group(bot, message.chat.id, initiator_id=message.from_user.id, silent=False)
     if not ok:
-        await message.answer(msg)
+        await bot.send_message(message.from_user.id, "❌ Failed to start exam. Make sure preset is READY and questions exist.")
 
 @router.message(Command("stop_exam"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def cmd_stop_exam(message: Message, bot: Bot):
-    u = message.from_user
-    if not u:
-        return
-    if not await is_admin_or_owner(bot, message.chat.id, u.id):
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        await bot.send_message(u.id, "⚠️ Not allowed. Contact: @Your_Himus / @Probaho_Robot")
+    if not is_internal_admin(message.from_user.id):
+        await deny_and_warn(message, bot, delete_in_group=True)
         return
 
-    session = EXAMS.get(message.chat.id)
-    if not session or not session.active:
-        await message.answer("ℹ️ No active exam.")
-        return
-
-    session.active = False
-    await message.answer("⛔ Exam stopped. Generating results...")
-    await finish_exam(session, bot)
-
-# ===================== GROUP LOCK (EXAM ACTIVE) =====================
-
-@router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
-async def group_lock_handler(message: Message, bot: Bot):
-    session = EXAMS.get(message.chat.id)
-    if not session or not session.active:
-        return
-
-    u = message.from_user
-    if not u:
-        return
-
-    allowed = await is_admin_or_owner(bot, message.chat.id, u.id)
-    if allowed:
-        return
-
-    # delete any message
     try:
         await message.delete()
     except Exception:
         pass
 
-    # warning DM (do not spam: basic)
-    try:
-        await bot.send_message(
-            u.id,
-            "⚠️ Exam is running. Messaging is disabled.\nContact: @Your_Himus / @Probaho_Robot"
-        )
-    except Exception:
-        pass
+    session = EXAMS.get(message.chat.id)
+    if not session or not session.active:
+        return
+    session.active = False
+    await finish_exam(bot, session, stopped=True)
 
-# ===================== POLL ANSWERS =====================
 
+# =========================================================
+#  Poll answers
+# =========================================================
 @router.poll_answer()
-async def handle_poll_answer(poll_answer: PollAnswer):
+async def poll_answer(poll_answer: PollAnswer):
     poll_id = poll_answer.poll_id
     user = poll_answer.user
     chosen_option_ids = poll_answer.option_ids or []
 
-    target_session: Optional[ExamSession] = None
+    target: Optional[ExamSession] = None
     q_idx: Optional[int] = None
-
     for s in EXAMS.values():
         if poll_id in s.poll_id_to_q_idx:
-            target_session = s
+            target = s
             q_idx = s.poll_id_to_q_idx[poll_id]
             break
-    if target_session is None or q_idx is None:
+    if target is None or q_idx is None:
         return
 
-    s = target_session
-    answered_set = s.answered_users_per_q.setdefault(q_idx, set())
-    if user.id in answered_set:
+    s = target
+    answered = s.answered_users_per_q.setdefault(q_idx, set())
+    if user.id in answered:
         return
-    answered_set.add(user.id)
+    answered.add(user.id)
 
     if user.id not in s.results:
         s.results[user.id] = UserResult(
             user_id=user.id,
-            full_name=(user.full_name or "Unknown"),
-            username=user.username
+            full_name=user.full_name or "Unknown",
+            username=user.username,
         )
     r = s.results[user.id]
 
@@ -1057,57 +1133,314 @@ async def handle_poll_answer(poll_answer: PollAnswer):
 
     chosen = chosen_option_ids[0]
     correct_id = s.questions[q_idx].correct_id
-
     if chosen == correct_id:
         r.correct += 1
         r.score += s.mark_per_q
         r.answers[q_idx] = "C"
     else:
         r.wrong += 1
-        r.score -= s.negative_mark
+        r.score -= s.negative
         r.answers[q_idx] = "W"
 
-# ===================== EXAM FLOW =====================
 
-async def run_exam(session: ExamSession, bot: Bot):
-    try:
-        total_q = len(session.questions)
-        for idx, q in enumerate(session.questions):
-            if not session.active:
-                break
-            session.current_index = idx
+# =========================================================
+#  Exam engine
+# =========================================================
+async def run_exam(bot: Bot, session: ExamSession):
+    total = len(session.questions)
+    for idx, q in enumerate(session.questions):
+        if not session.active:
+            break
+        session.current_index = idx
 
+        try:
             msg = await bot.send_poll(
                 chat_id=session.chat_id,
-                question=f"Q{idx+1}/{total_q}: {q.text}",
+                question=f"Q{idx+1}/{total}: {q.text}",
                 options=q.options,
                 type="quiz",
                 correct_option_id=q.correct_id,
                 is_anonymous=False,
-                open_period=session.time_per_question,
+                open_period=session.time_per_q,
             )
             session.poll_id_to_q_idx[msg.poll.id] = idx
+            session.posted_message_ids[idx] = msg.message_id
             session.answered_users_per_q.setdefault(idx, set())
 
-            await asyncio.sleep(session.time_per_question + 2)
+        except Exception as e:
+            logging.exception("send_poll failed: %s", e)
+            session.active = False
+            break
 
-        session.active = False
-        await finish_exam(session, bot)
+        await asyncio.sleep(session.time_per_q + 2)
 
-    except Exception as e:
-        logging.exception("run_exam error: %s", e)
+    session.active = False
+    await finish_exam(bot, session, stopped=False)
+
+
+# =========================================================
+#  Leaderboard Image
+# =========================================================
+def _pick_font_path(candidates: List[str]) -> Optional[str]:
+    for p in candidates:
         try:
-            await bot.send_message(session.chat_id, "❌ Unexpected error occurred.")
+            if p and os.path.exists(p):
+                return p
+        except Exception:
+            continue
+    return None
+
+def _load_font(size: int, kind: str = "latin") -> ImageFont.FreeTypeFont:
+    """
+    kind: latin | bengali | emoji
+    """
+    if kind == "bengali":
+        path = _pick_font_path(BENGALI_FONT_FILES) or _pick_font_path(LATIN_FONT_FILES)
+    elif kind == "emoji":
+        path = _pick_font_path(EMOJI_FONT_FILES) or _pick_font_path(LATIN_FONT_FILES)
+    else:
+        path = _pick_font_path(LATIN_FONT_FILES) or _pick_font_path(BENGALI_FONT_FILES) or _pick_font_path(EMOJI_FONT_FILES)
+
+    if path:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+def _is_emoji(ch: str) -> bool:
+    o = ord(ch)
+    return (
+        0x1F300 <= o <= 0x1FAFF  # emojis
+        or 0x2600 <= o <= 0x27BF  # misc symbols
+        or 0xFE00 <= o <= 0xFE0F  # variation selectors
+        or 0x1F1E6 <= o <= 0x1F1FF  # flags
+    )
+
+def draw_text_mixed(draw: ImageDraw.ImageDraw, xy: Tuple[int, int], text: str, font_text: ImageFont.FreeTypeFont, font_emoji: ImageFont.FreeTypeFont, fill) -> None:
+    x, y = xy
+    for ch in text:
+        font = font_emoji if _is_emoji(ch) else font_text
+        draw.text((x, y), ch, font=font, fill=fill)
+        try:
+            w = draw.textlength(ch, font=font)
+        except Exception:
+            w = font.getlength(ch) if hasattr(font, "getlength") else font.getsize(ch)[0]
+        x += int(w)
+
+def generate_leaderboard_image(exam_name: str, rows: List[Tuple[int, str, float, int, int, int]], out_path: str) -> None:
+    # dark + glow
+    W, H = 1080, 1350
+    bg = Image.new("RGB", (W, H), (10, 12, 18))
+    draw = ImageDraw.Draw(bg)
+
+    title_font = _load_font(54, "bengali")
+    sub_font = _load_font(28, "latin")
+    row_font = _load_font(34, "bengali")
+    emoji_title = _load_font(54, "emoji")
+    emoji_row = _load_font(34, "emoji")
+    emoji_sub = _load_font(28, "emoji")
+
+    # glow title
+    title = f"LEADERBOARD — {exam_name}"
+    tx, ty = 60, 50
+
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gdraw = ImageDraw.Draw(glow)
+    draw_text_mixed(gdraw, (tx, ty), title, title_font, emoji_title, (120, 200, 255, 220))
+    glow = glow.filter(ImageFilter.GaussianBlur(radius=8))
+    bg = Image.alpha_composite(bg.convert("RGBA"), glow).convert("RGB")
+    draw = ImageDraw.Draw(bg)
+    draw_text_mixed(draw, (tx, ty), title, title_font, emoji_title, (230, 245, 255))
+
+    draw_text_mixed(draw, (60, 120), "Top performers (score includes negative marking)", sub_font, emoji_sub, (170, 180, 200))
+
+    # table header
+    y = 190
+    draw.rounded_rectangle((50, y, W - 50, y + 70), radius=18, fill=(18, 22, 32))
+    draw_text_mixed(draw, (70, y + 18), "Rank", sub_font, emoji_sub, (220, 225, 240))
+    draw_text_mixed(draw, (210, y + 18), "Name", sub_font, emoji_sub, (220, 225, 240))
+    draw_text_mixed(draw, (840, y + 18), "Score", sub_font, emoji_sub, (220, 225, 240))
+
+    y += 90
+    card_h = 90
+    for rank, name, score, c, w, s in rows:
+        # card
+        draw.rounded_rectangle((50, y, W - 50, y + card_h), radius=18, fill=(14, 18, 28))
+        # subtle glow for top 3
+        if rank <= 3:
+            g = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            gd = ImageDraw.Draw(g)
+            gd.rounded_rectangle((50, y, W - 50, y + card_h), radius=18, fill=(80, 180, 255, 40))
+            g = g.filter(ImageFilter.GaussianBlur(radius=6))
+            bg = Image.alpha_composite(bg.convert("RGBA"), g).convert("RGB")
+            draw = ImageDraw.Draw(bg)
+
+        draw_text_mixed(draw, (75, y + 25), f"{rank}", row_font, emoji_row, (230, 235, 250))
+        # trim name
+        n = name
+        if len(n) > 28:
+            n = n[:27] + "…"
+        draw_text_mixed(draw, (210, y + 25), n, row_font, emoji_row, (230, 235, 250))
+        draw.text((840, y + 25), f"{score:.2f}", font=row_font, fill=(210, 255, 220))
+
+        # small stats
+        draw.text((210, y + 60), f"C:{c}  W:{w}  S:{s}", font=_load_font(22, "latin"), fill=(150, 160, 185))
+
+        y += card_h + 18
+        if y > H - 140:
+            break
+
+    draw.text((60, H - 60), "Generated by Extreme Exam Bot", font=_load_font(20, "latin"), fill=(120, 130, 150))
+    bg.save(out_path, format="PNG")
+
+
+# =========================================================
+#  PDF Report
+# =========================================================
+def _register_pdf_fonts() -> Tuple[str, str]:
+    """
+    Returns (text_font_name, emoji_font_name). Falls back to Helvetica if no TTF found.
+    """
+    text_font_name = "Helvetica"
+    emoji_font_name = "Helvetica"
+
+    bn_path = _pick_font_path(BENGALI_FONT_FILES)
+    if bn_path:
+        try:
+            pdfmetrics.registerFont(TTFont("BN", bn_path))
+            text_font_name = "BN"
         except Exception:
             pass
 
-async def finish_exam(session: ExamSession, bot: Bot):
+    em_path = _pick_font_path(EMOJI_FONT_FILES)
+    # NotoEmoji-Regular.ttf is monochrome; Segoe UI Emoji also works for many glyphs
+    if em_path:
+        try:
+            pdfmetrics.registerFont(TTFont("EMOJI", em_path))
+            emoji_font_name = "EMOJI"
+        except Exception:
+            pass
+
+    return text_font_name, emoji_font_name
+
+def _pdf_is_emoji(ch: str) -> bool:
+    return _is_emoji(ch)
+
+def pdf_draw_mixed(c: canvas.Canvas, x: float, y: float, text: str, font_text: str, font_emoji: str, size: int, color=colors.black) -> None:
+    c.setFillColor(color)
+    cx = x
+    for ch in text:
+        fn = font_emoji if _pdf_is_emoji(ch) else font_text
+        try:
+            c.setFont(fn, size)
+        except Exception:
+            c.setFont("Helvetica", size)
+        c.drawString(cx, y, ch)
+        # crude advance; works well enough for reports
+        cx += (size * 0.55) if _pdf_is_emoji(ch) else (size * 0.52)
+
+def generate_pdf_report(exam_name: str, results: List[UserResult], total_q: int, mark_per_q: float, negative: float, out_path: str) -> None:
+    """
+    Designed PDF with Bangla + emoji best-effort via embedded TTF fonts.
+    Put fonts into ./fonts for full unicode rendering.
+    """
+    font_text, font_emoji = _register_pdf_fonts()
+
+    c = canvas.Canvas(out_path, pagesize=A4)
+    w, h = A4
+    margin = 1.6 * cm
+
+    # Background header block
+    c.setFillColor(colors.HexColor("#0B1020"))
+    c.rect(0, h - 4.2*cm, w, 4.2*cm, stroke=0, fill=1)
+
+    # Title
+    pdf_draw_mixed(c, margin, h - 2.2*cm, f"Exam Report — {exam_name}", font_text, font_emoji, 18, color=colors.white)
+
+    c.setFillColor(colors.HexColor("#C7D2FE"))
+    c.setStrokeColor(colors.HexColor("#22305A"))
+    c.setLineWidth(1)
+    c.roundRect(margin, h - 3.5*cm, w - 2*margin, 1.0*cm, 10, stroke=1, fill=0)
+
+    info = f"Total Questions: {total_q}   |   Mark/Q: +{mark_per_q}   |   Negative: -{negative}   |   Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    pdf_draw_mixed(c, margin + 0.4*cm, h - 3.15*cm, info, font_text, font_emoji, 10, color=colors.HexColor("#C7D2FE"))
+
+    # Leaderboard table container
+    table_top = h - 5.0*cm
+    c.setFillColor(colors.HexColor("#F8FAFC"))
+    c.roundRect(margin, 1.6*cm, w - 2*margin, table_top - 1.6*cm, 12, stroke=0, fill=1)
+
+    # Table header row
+    header_h = 0.9*cm
+    c.setFillColor(colors.HexColor("#111827"))
+    c.roundRect(margin, table_top - header_h, w - 2*margin, header_h, 12, stroke=0, fill=1)
+
+    cols = [margin + 0.4*cm, margin + 2.0*cm, margin + 12.2*cm, margin + 14.4*cm, margin + 16.0*cm, margin + 17.6*cm]
+    headers = ["#", "Name", "Score", "C", "W", "S"]
+    for i, head in enumerate(headers):
+        pdf_draw_mixed(c, cols[i], table_top - 0.62*cm, head, font_text, font_emoji, 10, color=colors.white)
+
+    # Rows
+    y = table_top - header_h - 0.55*cm
+    row_h = 0.62*cm
+
+    c.setFillColor(colors.HexColor("#0F172A"))
+    for rank, r in enumerate(results, start=1):
+        if y < 2.3*cm:
+            c.showPage()
+            # Re-draw minimal header on new page
+            c.setFillColor(colors.HexColor("#0B1020"))
+            c.rect(0, h - 2.3*cm, w, 2.3*cm, stroke=0, fill=1)
+            pdf_draw_mixed(c, margin, h - 1.5*cm, f"Exam Report — {exam_name} (cont.)", font_text, font_emoji, 14, color=colors.white)
+            table_top = h - 3.0*cm
+            c.setFillColor(colors.HexColor("#F8FAFC"))
+            c.roundRect(margin, 1.6*cm, w - 2*margin, table_top - 1.6*cm, 12, stroke=0, fill=1)
+            c.setFillColor(colors.HexColor("#111827"))
+            c.roundRect(margin, table_top - header_h, w - 2*margin, header_h, 12, stroke=0, fill=1)
+            for i, head in enumerate(headers):
+                pdf_draw_mixed(c, cols[i], table_top - 0.62*cm, head, font_text, font_emoji, 10, color=colors.white)
+            y = table_top - header_h - 0.55*cm
+
+        # zebra rows
+        if rank % 2 == 0:
+            c.setFillColor(colors.HexColor("#EEF2FF"))
+            c.roundRect(margin + 0.15*cm, y - 0.1*cm, w - 2*margin - 0.3*cm, row_h + 0.25*cm, 8, stroke=0, fill=1)
+
+        name = r.full_name + (f" (@{r.username})" if r.username else "")
+        if len(name) > 60:
+            name = name[:59] + "…"
+
+        pdf_draw_mixed(c, cols[0], y, str(rank), font_text, font_emoji, 10, color=colors.HexColor("#0F172A"))
+        pdf_draw_mixed(c, cols[1], y, name, font_text, font_emoji, 10, color=colors.HexColor("#0F172A"))
+        pdf_draw_mixed(c, cols[2], y, f"{r.score:.2f}", font_text, font_emoji, 10, color=colors.HexColor("#065F46"))
+        pdf_draw_mixed(c, cols[3], y, str(r.correct), font_text, font_emoji, 10, color=colors.HexColor("#0F172A"))
+        pdf_draw_mixed(c, cols[4], y, str(r.wrong), font_text, font_emoji, 10, color=colors.HexColor("#B91C1C"))
+        pdf_draw_mixed(c, cols[5], y, str(r.skipped), font_text, font_emoji, 10, color=colors.HexColor("#0F172A"))
+
+        y -= row_h
+
+    c.save()
+
+
+# =========================================================
+#  Finish exam: image + DM analysis + PDF to owner/admins
+# =========================================================
+def motivational_speech() -> str:
+    return (
+        "Keep going.\n"
+        "Small progress every day becomes massive results over time.\n"
+        "Focus, practice, and improve—your next attempt will be better."
+    )
+
+async def finish_exam(bot: Bot, session: ExamSession, stopped: bool):
     if session.finished:
         return
     session.finished = True
+
     total_q = len(session.questions)
 
-    # fill skipped
+    # fill skipped & ensure answers map complete
     for r in session.results.values():
         answered = r.correct + r.wrong
         r.skipped = total_q - answered
@@ -1115,57 +1448,147 @@ async def finish_exam(session: ExamSession, bot: Bot):
             if qi not in r.answers:
                 r.answers[qi] = "S"
 
+    # sort with negative included (score already includes negative)
     sorted_results = sorted(session.results.values(), key=lambda x: (-x.score, -x.correct))
-    if not sorted_results:
-        await bot.send_message(session.chat_id, "ℹ️ No one answered.")
+
+    # Build leaderboard rows (top 10 or fewer)
+    top_n = min(10, len(sorted_results))
+    rows = []
+    for i in range(top_n):
+        r = sorted_results[i]
+        name = r.full_name + (f" (@{r.username})" if r.username else "")
+        rows.append((i+1, name, r.score, r.correct, r.wrong, r.skipped))
+
+    # Generate leaderboard image (even if 0 users, show empty image)
+    img_path = os.path.join(DATA_DIR, f"leaderboard_{session.chat_id}.png")
+    if rows:
+        generate_leaderboard_image(session.exam_name, rows, img_path)
     else:
-        top_n = min(10, len(sorted_results))
-        lines = [f"🏆 Leaderboard: {session.exam_name}\n"]
-        for i, r in enumerate(sorted_results[:top_n], start=1):
-            name = r.full_name + (f" (@{r.username})" if r.username else "")
-            lines.append(f"{i}. {name} — {r.score:.2f} (C:{r.correct} W:{r.wrong} S:{r.skipped})")
-        await bot.send_message(session.chat_id, "\n".join(lines))
+        generate_leaderboard_image(session.exam_name, [(1, "No participants", 0.0, 0, 0, total_q)], img_path)
 
-        # DM detailed results
-        for rank, r in enumerate(sorted_results, start=1):
-            msg = (
-                f"📌 Exam: {session.exam_name}\n"
-                f"Rank: {rank}\n"
-                f"Score: {r.score:.2f}\n"
-                f"Correct: {r.correct}\nWrong: {r.wrong}\nSkipped: {r.skipped}\n\n"
-                "Motivation:\n"
-                "Keep going — consistency beats talent when talent doesn’t stay consistent."
-            )
-            try:
-                await bot.send_message(r.user_id, msg)
-            except Exception:
-                pass
+    # Send image to group (ONLY image)
+    try:
+        from aiogram.types import FSInputFile
+        await bot.send_photo(session.chat_id, FSInputFile(img_path), caption=f"🏆 {session.exam_name} — Top {top_n if rows else 0}")
+    except Exception:
+        pass
 
-    # clear everything after exam (as you requested)
+    # DM per-user analysis
+    groups = load_groups()
+    meta = groups.get(str(session.chat_id), {})
+    public_username = meta.get("public_username")
+
+    for rank, r in enumerate(sorted_results, start=1):
+        # Build serial lists with links
+        right_links = []
+        wrong_links = []
+        skip_links = []
+
+        for qi in range(total_q):
+            status = r.answers.get(qi, "S")
+            msg_id = session.posted_message_ids.get(qi)
+            link = ""
+            if msg_id:
+                link = make_message_link(session.chat_id, msg_id, public_username)
+            item = f"{qi+1}" + (f" — {link}" if link else "")
+            if status == "C":
+                right_links.append(item)
+            elif status == "W":
+                wrong_links.append(item)
+            else:
+                skip_links.append(item)
+
+        dm = (
+            f"✅ <b>Exam:</b> {session.exam_name}\n"
+            f"🏅 <b>Rank:</b> {rank}\n\n"
+            f"📌 <b>Total Questions:</b> {total_q}\n"
+            f"✅ <b>Correct:</b> {r.correct}\n"
+            f"❌ <b>Wrong:</b> {r.wrong}\n"
+            f"⏭️ <b>Skipped:</b> {r.skipped}\n\n"
+            f"🎯 <b>Mark/Q:</b> +{session.mark_per_q}\n"
+            f"⚠️ <b>Negative:</b> -{session.negative}\n"
+            f"🏁 <b>Total Score:</b> <b>{r.score:.2f}</b>\n\n"
+            f"💬 <b>Motivation</b>\n{motivational_speech()}\n\n"
+            f"✅ <b>Correct (serial + link)</b>\n" + ("\n".join(right_links) if right_links else "None") + "\n\n"
+            f"❌ <b>Wrong (serial + link)</b>\n" + ("\n".join(wrong_links) if wrong_links else "None") + "\n\n"
+            f"⏭️ <b>Skipped (serial + link)</b>\n" + ("\n".join(skip_links) if skip_links else "None")
+        )
+        try:
+            await bot.send_message(r.user_id, dm, disable_web_page_preview=True)
+        except Exception:
+            # user didn't /start bot, can't DM
+            pass
+
+    # PDF to owner + internal admins
+    pdf_path = os.path.join(DATA_DIR, f"report_{session.chat_id}.pdf")
+    generate_pdf_report(session.exam_name, sorted_results, total_q, session.mark_per_q, session.negative, pdf_path)
+
+    recipients = {OWNER_ID} | set(INTERNAL_ADMINS)
+    from aiogram.types import FSInputFile
+    for uid in recipients:
+        try:
+            await bot.send_document(uid, FSInputFile(pdf_path), caption=f"📄 Exam Report — {session.exam_name}")
+        except Exception:
+            pass
+
+    # Auto clear data after finish (as requested)
     EXAMS.pop(session.chat_id, None)
     QUESTION_BANK.clear()
-    save_question_bank(QUESTION_BANK)
+    save_questions(QUESTION_BANK)
 
-    # preset becomes not ready (must setup again)
-    cid = str(session.chat_id)
-    p = preset_for(cid)
+    # preset becomes NOT READY
+    gid = str(session.chat_id)
+    p = get_preset(gid)
     p.ready = False
-    save_preset(cid, p)
+    save_preset(gid, p)
 
-    await bot.send_message(session.chat_id, "✅ Exam finished. Data cleared. Setup again for next exam.")
+    # No noisy group messages for stop/finish (you requested)
 
-# ====================== MAIN ======================
 
+# =========================================================
+#  Diagnostics (DM)
+# =========================================================
+@router.message(Command("diagnose"), F.chat.type == ChatType.PRIVATE)
+async def cmd_diagnose(message: Message, bot: Bot):
+    if not is_internal_admin(message.from_user.id):
+        await message.answer(unauthorized_text())
+        return
+    groups = load_groups()
+    presets = load_presets()
+    txt = (
+        f"<b>Diagnostics</b>\n\n"
+        f"Owner ID: <code>{OWNER_ID}</code>\n"
+        f"Internal Admins: <b>{len(INTERNAL_ADMINS)}</b>\n"
+        f"Bound Groups: <b>{len(groups)}</b>\n"
+        f"Presets: <b>{len(presets)}</b>\n"
+        f"Questions: <b>{len(QUESTION_BANK)}</b>\n"
+        f"Active Exams: <b>{sum(1 for s in EXAMS.values() if s.active)}</b>\n\n"
+        f"<b>Announcement</b>: send content → /announce → pick group\n"
+        f"<b>Exam</b>: setup preset READY in /admin_panel → group /start_exam\n"
+    )
+    await message.answer(txt)
+
+
+# =========================================================
+#  MAIN
+# =========================================================
 async def main():
     logging.basicConfig(level=logging.INFO)
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing. Set it in Windows PowerShell: $env:BOT_TOKEN='...'.")
-    bot = Bot(BOT_TOKEN)
+
+    if not BOT_TOKEN or "PASTE_YOUR_BOT_TOKEN_HERE" in BOT_TOKEN:
+        raise RuntimeError("Set BOT_TOKEN at top of the file (hardcoded).")
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+
     dp = Dispatcher()
     dp.include_router(router)
 
-    logging.info("Bot starting (aiogram v3 polling)...")
+    logging.info("Extreme Exam Bot (code-fixed) starting...")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
