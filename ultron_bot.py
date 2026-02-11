@@ -5,7 +5,6 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
-from aiogram.exceptions import SkipHandler
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -396,18 +395,20 @@ async def cmd_start(message: Message):
 
     await message.answer(text)
 
+def admin_id_list() -> List[int]:
+    return [OWNER_ID, *list(INTERNAL_ADMINS)]
 
-@router.message(F.chat.type == ChatType.PRIVATE, F.text.startswith("/"))
+@router.message(
+    F.chat.type == ChatType.PRIVATE,
+    Command(),  # যেকোনো command ধরবে
+    ~F.from_user.id.in_(admin_id_list())  # কিন্তু শুধু non-admin হলে
+)
 async def participant_command_guard(message: Message):
-    # যদি admin হয়, তাহলে এই handler স্কিপ করে পরের command handlers চলতে দাও
-    if is_internal_admin(message.from_user.id):
-        raise SkipHandler()
-
     # participants শুধু /start চালাতে পারবে
-    if message.text.strip().startswith("/start"):
-        raise SkipHandler()
-
+    if message.text and message.text.strip().startswith("/start"):
+        return
     await message.answer(unauthorized_text())
+
 
 
 
@@ -1588,4 +1589,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
