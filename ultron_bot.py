@@ -4224,7 +4224,9 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Ticket: {tid}\n"
         f"From: {who} | {code(uid)}"
     )
-
+    kb = InlineKeyboardMarkup([
+      [InlineKeyboardButton("👤 Open Profile", url=f"tg://user?id={uid}")]
+    ])
     if text:
         for sid in staff_ids:
             await safe_send_text(context.bot, sid, f"{header}\n\n{text}", protect=False, reply_markup=kb)
@@ -4232,9 +4234,6 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for sid in staff_ids:
             await safe_send_text(context.bot, sid, f"{header}\n\n[MEDIA MESSAGE RECEIVED]", protect=False, reply_markup=kb)
   
-    kb = InlineKeyboardMarkup([
-      [InlineKeyboardButton("👤 Open Profile", url=f"tg://user?id={uid}")]
-    ])
     # Copy replied content to staff (supports all media)
     if replied:
         for sid in staff_ids:
@@ -4798,5 +4797,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
