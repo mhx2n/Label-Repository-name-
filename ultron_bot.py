@@ -1427,7 +1427,7 @@ async def safe_reply(update: Update, text: str) -> None:
                 )
 
 
-async def safe_send_text(bot, chat_id: int, text: str, protect: bool = False) -> None:
+async def safe_send_text(bot, chat_id: int, text: str, protect: bool = False, reply_markup=None) -> None:
     try:
         await bot.send_message(
             chat_id=chat_id,
@@ -1435,6 +1435,7 @@ async def safe_send_text(bot, chat_id: int, text: str, protect: bool = False) ->
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
             protect_content=protect,
+            reply_markup=reply_markup,
         )
     except RetryAfter as e:
         await asyncio.sleep(float(e.retry_after) + 0.2)
@@ -4226,11 +4227,14 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text:
         for sid in staff_ids:
-            await safe_send_text(context.bot, sid, f"{header}\n\n{text}", protect=False)
+            await safe_send_text(context.bot, sid, f"{header}\n\n{text}", protect=False, reply_markup=kb)
     else:
         for sid in staff_ids:
-            await safe_send_text(context.bot, sid, f"{header}\n\n[MEDIA MESSAGE RECEIVED]", protect=False)
-
+            await safe_send_text(context.bot, sid, f"{header}\n\n[MEDIA MESSAGE RECEIVED]", protect=False, reply_markup=kb)
+  
+    kb = InlineKeyboardMarkup([
+      [InlineKeyboardButton("👤 Open Profile", url=f"tg://user?id={uid}")]
+    ])
     # Copy replied content to staff (supports all media)
     if replied:
         for sid in staff_ids:
@@ -4794,4 +4798,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
