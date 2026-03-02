@@ -825,6 +825,10 @@ def b(s: Any) -> str:
 def code(s: Any) -> str:
     return f"<code>{h(s)}</code>"
 
+def mention_user(uid: int, name: str = "User") -> str:
+    # Clickable mention (Telegram HTML)
+    return f'<a href="tg://user?id={uid}">{h(name or "User")}</a>'
+  
 def md_to_html_basic(s: str) -> str:
     """Convert a small subset of Markdown (**bold**, `code`) to Telegram-safe HTML."""
     if not s:
@@ -4209,10 +4213,15 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     staff_ids = list_staff_ids()
 
+    name = update.effective_user.first_name or (
+     f"@{update.effective_user.username}" if update.effective_user.username else "User"
+    )
+    who = mention_user(uid, name)
+
     header = (
         f"📩 New Support Message\n"
         f"Ticket: {tid}\n"
-        f"From: {uid} ({update.effective_user.first_name or ''})"
+        f"From: {who} | {code(uid)}"
     )
 
     if text:
@@ -4785,3 +4794,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
