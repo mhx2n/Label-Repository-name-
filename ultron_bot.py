@@ -1404,6 +1404,63 @@ def require_vision_silent(func):
     return wrapper
 
 
+async def safe_send_text(bot, chat_id: int, text: str, protect: bool = False, reply_markup=None) -> bool:
+    # 1) chunk করে পাঠাই যাতে লম্বা মেসেজেও না ভাঙে
+    for part in chunk_text(text, 3500):
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=part,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                protect_content=protect,
+                reply_markup=reply_markup,
+            )
+        except RetryAfter as e:
+            await asyncio.sleep(float(e.retry_after) + 0.2)
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=part,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    protect_content=protect,
+                    reply_markup=reply_markup,
+                )
+            except TelegramError:
+                # 2) HTML fail হলে plain text fallback
+                try:
+                    plain = re.sub(r"<[^>]+>", "", part)
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=plain,
+                        disable_web_page_preview=True,
+                        protect_content=protect,
+                        reply_markup=reply_markup,
+                    )
+                except Exception:
+                    return False
+            except Exception:
+                return False
+
+        except TelegramError:
+            # HTML fail / blocked / misc tg errors → fallback
+            try:
+                plain = re.sub(r"<[^>]+>", "", part)
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=plain,
+                    disable_web_page_preview=True,
+                    protect_content=protect,
+                    reply_markup=reply_markup,
+                )
+            except Exception:
+                return False
+
+        except Exception:
+            return False
+
+    return True
 # ---------------------------
 # TELEGRAM SAFE SEND
 # ---------------------------
@@ -1427,59 +1484,7 @@ async def safe_reply(update: Update, text: str) -> None:
                 )
 
 
-async def safe_send_text(bot, chat_id: int, text: str, protect: bool = False, reply_markup=None) -> None:
-    try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            protect_content=protect,
-            reply_markup=reply_markup,
-        )
-    except RetryAfter as e:
-        await asyncio.sleep(float(e.retry_after) + 0.2)
-        with contextlib.suppress(Exception):
-            await bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                protect_content=protect,
-            )
-    except (Forbidden, TelegramError):
-        pass
-    except Exception:
-        pass
 
-
-async def safe_copy_message(bot, chat_id: int, from_chat_id: int, message_id: int, protect: bool = False) -> bool:
-    """
-    Copies a message without forward header.
-    protect_content=True restricts forwarding/saving (Telegram feature).
-    """
-    try:
-        await bot.copy_message(
-            chat_id=chat_id,
-            from_chat_id=from_chat_id,
-            message_id=message_id,
-            protect_content=protect,
-        )
-        return True
-    except RetryAfter as e:
-        await asyncio.sleep(float(e.retry_after) + 0.2)
-        with contextlib.suppress(Exception):
-            await bot.copy_message(
-                chat_id=chat_id,
-                from_chat_id=from_chat_id,
-                message_id=message_id,
-                protect_content=protect,
-            )
-            return True
-    except (Forbidden, TelegramError):
-        return False
-    except Exception:
-        return False
 
 
 
@@ -4227,23 +4232,36 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
       [InlineKeyboardButton("👤 Open Profile", url=f"tg://user?id={uid}")]
     ])
+    delivered_any = False
+
     if text:
+        payload = f"{header}\n\n{h(text)}"
         for sid in staff_ids:
-            await safe_send_text(context.bot, sid, f"{header}\n\n{h(text)}", protect=False, reply_markup=kb)
+          okk = await safe_send_text(context.bot, sid, payload, protect=False, reply_markup=kb)
+          delivered_any = delivered_any or okk
     else:
+        payload = f"{header}\n\n[MEDIA MESSAGE RECEIVED]"
         for sid in staff_ids:
-            await safe_send_text(context.bot, sid, f"{header}\n\n[MEDIA MESSAGE RECEIVED]", protect=False, reply_markup=kb)
+           okk = await safe_send_text(context.bot, sid, payload, protect=False, reply_markup=kb)
+           delivered_any = delivered_any or okk
+
   
     # Copy replied content to staff (supports all media)
     if replied:
+        copied_any = False
         for sid in staff_ids:
-            await safe_copy_message(
+            okk = await safe_copy_message(
                 context.bot,
                 chat_id=sid,
                 from_chat_id=replied.chat_id,
                 message_id=replied.message_id,
                 protect=False,
             )
+            copied_any = copied_any or okk
+        delivered_any = delivered_any or copied_any
+     if not delivered_any:
+         await err(update, "Delivery Failed", "আপনার মেসেজ staff/owner-এর কাছে পৌঁছায়নি। একটু পরে আবার চেষ্টা করুন।")
+         return
 
     body = "A staff member will respond soon."
     await ok(update, "Message Received", body)
@@ -4797,6 +4815,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
