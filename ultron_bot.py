@@ -4245,7 +4245,7 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 protect=False,
             )
 
-    body = f"Ticket ID: {tid}\nA staff member will respond soon."
+    body = "A staff member will respond soon."
     await ok(update, "Message Received", body)
 
 
@@ -4797,6 +4797,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
