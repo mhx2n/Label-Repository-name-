@@ -4229,7 +4229,7 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     if text:
         for sid in staff_ids:
-            await safe_send_text(context.bot, sid, f"{header}\n\n{text}", protect=False, reply_markup=kb)
+            await safe_send_text(context.bot, sid, f"{header}\n\n{h(text)}", protect=False, reply_markup=kb)
     else:
         for sid in staff_ids:
             await safe_send_text(context.bot, sid, f"{header}\n\n[MEDIA MESSAGE RECEIVED]", protect=False, reply_markup=kb)
@@ -4797,6 +4797,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
