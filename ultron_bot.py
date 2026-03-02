@@ -4191,6 +4191,7 @@ async def cmd_private_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     uid = update.effective_user.id
+
     if is_banned(uid):
         await err(update, "Access Denied", f"You are banned.\nContact: {OWNER_CONTACT}")
         return
@@ -4220,7 +4221,7 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     staff_ids = list_staff_ids()
 
     name = update.effective_user.first_name or (
-     f"@{update.effective_user.username}" if update.effective_user.username else "User"
+        f"@{update.effective_user.username}" if update.effective_user.username else "User"
     )
     who = mention_user(uid, name)
 
@@ -4229,23 +4230,24 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Ticket: {tid}\n"
         f"From: {who} | {code(uid)}"
     )
+
     kb = InlineKeyboardMarkup([
-      [InlineKeyboardButton("👤 Open Profile", url=f"tg://user?id={uid}")]
+        [InlineKeyboardButton("👤 Open Profile", url=f"tg://user?id={uid}")]
     ])
+
     delivered_any = False
 
     if text:
         payload = f"{header}\n\n{h(text)}"
         for sid in staff_ids:
-          okk = await safe_send_text(context.bot, sid, payload, protect=False, reply_markup=kb)
-          delivered_any = delivered_any or okk
+            okk = await safe_send_text(context.bot, sid, payload, protect=False, reply_markup=kb)
+            delivered_any = delivered_any or okk
     else:
         payload = f"{header}\n\n[MEDIA MESSAGE RECEIVED]"
         for sid in staff_ids:
-           okk = await safe_send_text(context.bot, sid, payload, protect=False, reply_markup=kb)
-           delivered_any = delivered_any or okk
+            okk = await safe_send_text(context.bot, sid, payload, protect=False, reply_markup=kb)
+            delivered_any = delivered_any or okk
 
-  
     # Copy replied content to staff (supports all media)
     if replied:
         copied_any = False
@@ -4259,9 +4261,10 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             copied_any = copied_any or okk
         delivered_any = delivered_any or copied_any
-     if not delivered_any:
-         await err(update, "Delivery Failed", "আপনার মেসেজ staff/owner-এর কাছে পৌঁছায়নি। একটু পরে আবার চেষ্টা করুন।")
-         return
+
+    if not delivered_any:
+        await err(update, "Delivery Failed", "আপনার মেসেজ staff/owner-এর কাছে পৌঁছায়নি। একটু পরে আবার চেষ্টা করুন।")
+        return
 
     body = "A staff member will respond soon."
     await ok(update, "Message Received", body)
@@ -4815,6 +4818,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
