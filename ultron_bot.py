@@ -29,6 +29,10 @@ import datetime as dt
 import json
 import logging
 from multiprocessing import context
+
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import os
 import re
 import sqlite3
@@ -64,8 +68,8 @@ from telegram.ext import (
 # =========================================================
 # ✅ HARD-CODED CONFIG
 # =========================================================
-BOT_TOKEN = "8286585007:AAHz1NIOXIbkBATy9qdcrQtHNr0DauL325U"  # set in Pella Env Vars
-OWNER_ID = 8389621809  # your Telegram numeric user id
+BOT_TOKEN = "8427023407:AAF9OMt3WuAJjxCmqSTzX5qRquDMi9fQGxU"  # set in Pella Env Vars
+OWNER_ID = 8535385246  # your Telegram numeric user id
 
 OWNER_CONTACT = "@Your_Himus"
 BOT_BRAND = "প্রবাহ"
@@ -109,7 +113,7 @@ GEMINI_TEXT_TIMEOUT_SECONDS = 25  # faster text responses
 # ---------------------------
 # If you want NO Google API key usage for /solve_on (users), keep this False.
 # When False, the bot will use only Gemini3 (Gemini3.py / web session) and will NOT call Google AI Studio REST.
-USE_OFFICIAL_GEMINI_REST_FALLBACK = False
+USE_OFFICIAL_GEMINI_REST_FALLBACK = True
 
 # Use official Gemini REST for Generate Quiz JSON (recommended). Works even if solve REST fallback is disabled.
 USE_GEMINI_REST_FOR_GENQUIZ = True
@@ -137,6 +141,30 @@ if not BOT_TOKEN:
     raise SystemExit("Please set BOT_TOKEN inside the code first.")
 if not isinstance(OWNER_ID, int) or OWNER_ID <= 0:
     raise SystemExit("Please set OWNER_ID (numeric) inside the code first.")
+
+
+# =========================================================
+# Render Free Web Service Health Server
+# =========================================================
+def _run_render_health_server():
+    port = int(os.getenv("PORT", "10000"))
+
+    class _HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, format, *args):
+            return
+
+    try:
+        server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+        server.serve_forever()
+    except Exception as e:
+        logging.exception("Health server failed: %s", e)
+
 
 # ---------------------------
 # LOGGING
@@ -624,11 +652,20 @@ async def on_solver_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             else:
                 answer = "Unknown model"
 
-            msg_html = h(answer)
+            if is_admin(uid) or is_owner(uid):
+                src_text = problem_text
+                if looks_like_programming_request(src_text) or looks_like_programming_request(answer):
+                    msg_html = f"<pre>{h(answer)}</pre>"
+                else:
+                    msg_html = h(answer)
+            else:
+                msg_html = h(answer)
             kb = _verify_kb(token, model, "text")
 
         with contextlib.suppress(Exception):
             await q.edit_message_text(msg_html, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        if q.message and getattr(q.message.chat, "type", "") in ("group", "supergroup"):
+            asyncio.create_task(_auto_delete_after(context.bot, q.message.chat_id, [q.message.message_id], 300))
 
     except Exception as e:
         db_log("ERROR", "solver_callback_failed", {"user_id": uid, "model": model, "error": str(e)})
@@ -825,10 +862,6 @@ def b(s: Any) -> str:
 def code(s: Any) -> str:
     return f"<code>{h(s)}</code>"
 
-def mention_user(uid: int, name: str = "User") -> str:
-    # Clickable mention (Telegram HTML)
-    return f'<a href="tg://user?id={uid}">{h(name or "User")}</a>'
-  
 def md_to_html_basic(s: str) -> str:
     """Convert a small subset of Markdown (**bold**, `code`) to Telegram-safe HTML."""
     if not s:
@@ -842,6 +875,16 @@ def to_int(s: str) -> Optional[int]:
         return int(str(s).strip())
     except Exception:
         return None
+
+
+def looks_like_programming_request(text: str) -> bool:
+    s = (text or "").lower()
+    keys = [
+        "python", "javascript", "js", "java", "c++", "cpp", "c#", "php", "sql", "html", "css",
+        "program", "code", "bug", "error", "traceback", "exception", "api", "function", "class",
+        "loop", "array", "dict", "json", "regex", "algorithm", "query", "database", "telegram bot"
+    ]
+    return any(k in s for k in keys)
 
 
 # ---------------------------
@@ -1312,6 +1355,23 @@ def set_solver_mode_on(user_id: int, value: bool) -> None:
     conn.close()
 
 
+
+
+def himusai_mode_on(user_id: int) -> bool:
+    """Alias for admin/owner inbox AI-only mode.
+
+    Historical builds used a separate HimusAI toggle name, but the current
+    database stores this state in users.solver_mode_on. Keeping this alias
+    prevents NameError in the active handlers and restores the previous flow
+    where private admin/owner chats skip poll/text buffering when HimusAI is on.
+    """
+    return solver_mode_on(user_id)
+
+
+def set_himusai_mode_on(user_id: int, value: bool) -> None:
+    """Persist HimusAI mode using the existing solver_mode_on column."""
+    set_solver_mode_on(user_id, value)
+
 def explain_mode_on(user_id: int) -> bool:
     """Command-based toggle: if ON, quizzes include explanation; if OFF, quizzes are posted without explanation."""
     conn = db_connect()
@@ -1404,63 +1464,6 @@ def require_vision_silent(func):
     return wrapper
 
 
-async def safe_send_text(bot, chat_id: int, text: str, protect: bool = False, reply_markup=None) -> bool:
-    # 1) chunk করে পাঠাই যাতে লম্বা মেসেজেও না ভাঙে
-    for part in chunk_text(text, 3500):
-        try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=part,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                protect_content=protect,
-                reply_markup=reply_markup,
-            )
-        except RetryAfter as e:
-            await asyncio.sleep(float(e.retry_after) + 0.2)
-            try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=part,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                    protect_content=protect,
-                    reply_markup=reply_markup,
-                )
-            except TelegramError:
-                # 2) HTML fail হলে plain text fallback
-                try:
-                    plain = re.sub(r"<[^>]+>", "", part)
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=plain,
-                        disable_web_page_preview=True,
-                        protect_content=protect,
-                        reply_markup=reply_markup,
-                    )
-                except Exception:
-                    return False
-            except Exception:
-                return False
-
-        except TelegramError:
-            # HTML fail / blocked / misc tg errors → fallback
-            try:
-                plain = re.sub(r"<[^>]+>", "", part)
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=plain,
-                    disable_web_page_preview=True,
-                    protect_content=protect,
-                    reply_markup=reply_markup,
-                )
-            except Exception:
-                return False
-
-        except Exception:
-            return False
-
-    return True
 # ---------------------------
 # TELEGRAM SAFE SEND
 # ---------------------------
@@ -1484,7 +1487,58 @@ async def safe_reply(update: Update, text: str) -> None:
                 )
 
 
+async def safe_send_text(bot, chat_id: int, text: str, protect: bool = False) -> None:
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            protect_content=protect,
+        )
+    except RetryAfter as e:
+        await asyncio.sleep(float(e.retry_after) + 0.2)
+        with contextlib.suppress(Exception):
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                protect_content=protect,
+            )
+    except (Forbidden, TelegramError):
+        pass
+    except Exception:
+        pass
 
+
+async def safe_copy_message(bot, chat_id: int, from_chat_id: int, message_id: int, protect: bool = False) -> bool:
+    """
+    Copies a message without forward header.
+    protect_content=True restricts forwarding/saving (Telegram feature).
+    """
+    try:
+        await bot.copy_message(
+            chat_id=chat_id,
+            from_chat_id=from_chat_id,
+            message_id=message_id,
+            protect_content=protect,
+        )
+        return True
+    except RetryAfter as e:
+        await asyncio.sleep(float(e.retry_after) + 0.2)
+        with contextlib.suppress(Exception):
+            await bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+                protect_content=protect,
+            )
+            return True
+    except (Forbidden, TelegramError):
+        return False
+    except Exception:
+        return False
 
 
 
@@ -1922,6 +1976,30 @@ def reply_text_or_caption(update: Update) -> str:
         return ""
     m = update.message.reply_to_message
     return (m.text or m.caption or "").strip()
+
+
+def parse_ticket_id_from_any_message(msg) -> Optional[int]:
+    if not msg:
+        return None
+    text = "\n".join([
+        str(getattr(msg, "text", "") or ""),
+        str(getattr(msg, "caption", "") or ""),
+    ]).strip()
+    if not text:
+        return None
+    patterns = [
+        r"(?:^|\n)\s*Ticket\s*[:#-]\s*(\d+)",
+        r"(?:^|\n)\s*Ticket ID\s*[:#-]\s*(\d+)",
+        r"/reply\s+(\d+)(?:\s|$)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return None
+    return None
 
 
 # ---------------------------
@@ -3148,18 +3226,15 @@ COMMANDS_REGISTRY = {
     "public": {
         "description": "👤 User Commands",
         "commands": {
-            "start": "Welcome message",
+            "start": "Welcome / membership check",
             "help": "Show detailed command guide",
-            "commands": "Show all available commands (categorized)",
-            #"features": "Alias for /commands",
-            "ask": "Contact support (send text or reply to message/file)",
-            "scanhelp": "Image→Quiz tutorial (for users with vision access)",
-            "vision_on": "Enable Image→Quiz (command-based)",
-            "vision_off": "Disable Image→Quiz",
-            "solve_on": "Enable problem-solving chat (users)",
-            "solve_off": "Disable problem-solving chat (users)",
-            "explain_on": "Enable explanations when posting quizzes (staff)",
-            "explain_off": "Disable explanations (post quiz only)",
+            "commands": "Show all available commands",
+            "ask": "Contact support (text or reply to file/photo)",
+            "solve_on": "Enable user AI solving",
+            "solve_off": "Disable user AI solving",
+            "scanhelp": "Image→Quiz tutorial (if vision granted)",
+            "vision_on": "Enable Image→Quiz mode",
+            "vision_off": "Disable Image→Quiz mode"
         }
     },
     "workflow": {
@@ -3181,19 +3256,29 @@ COMMANDS_REGISTRY = {
             "done": "Export CSV + JSON, clear buffer",
             "clear": "Clear buffer without exporting",
             "addchannel": "Add a target channel",
-            "listchannels": "List channels (yours or all if granted)",
+            "listchannels": "List channels (visible scope)",
             "removechannel": "Remove a channel",
-            "setprefix": "Set channel prefix text",
+            "setprefix": "Set channel prefix",
             "setexplink": "Set explanation link",
             "post": "Post buffered quizzes to channel",
+            "postemoji": "Post buffered emoji quizzes to channel",
             "broadcast": "Send message to all users",
             "adminpanel": "View posting leaderboard",
             "reply": "Reply to support ticket",
             "close": "Close support ticket",
             "ban": "Ban a user",
             "unban": "Unban a user",
-            "banned": "List banned users",
-            "private_send": "Send protected content (no forward/save)",
+            "banned": "Show ban log / banned users",
+            "private_send": "Send private message to a user",
+            "send_private": "Alias of /private_send",
+            "himusai_on": "Enable admin/owner inbox AI-only mode",
+            "himusai_off": "Disable admin/owner inbox AI-only mode",
+            "probaho_on": "Enable user AI in current group",
+            "probaho_off": "Disable user AI in current group",
+            "explain_on": "Enable explanation in quiz/csv/json exports",
+            "explain_off": "Disable explanation in quiz/csv/json exports",
+            "quizprefix": "Set global generated-quiz prefix",
+            "quizlink": "Set global generated-quiz link"
         }
     },
     "owner": {
@@ -3228,6 +3313,8 @@ COMMANDS_REGISTRY = {
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     uid = update.effective_user.id
+    if not await enforce_required_memberships(update, context):
+        return
     if is_banned(uid):
         await err(update, "Access Denied", f"You are banned.\n\nContact: {OWNER_CONTACT}")
         return
@@ -3247,6 +3334,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     uid = update.effective_user.id
 
+    if not await enforce_required_memberships(update, context):
+        return
+
     if is_banned(uid):
         await err(update, "Access Denied", f"You are banned.\n\nContact: {OWNER_CONTACT}")
         return
@@ -3260,6 +3350,9 @@ async def cmd_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show all available commands in a categorized list."""
     ensure_user(update)
     uid = update.effective_user.id
+
+    if not await enforce_required_memberships(update, context):
+        return
 
     if is_banned(uid):
         await err(update, "Access Denied", f"You are banned.\n\nContact: {OWNER_CONTACT}")
@@ -3666,6 +3759,69 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @require_admin
+
+
+async def on_image_react_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fallback callback for image reaction quizzes.
+
+    Some builds register an image-specific callback handler using the pattern
+    ``imgreact:<quiz_id>:<selected>``. Earlier code paths reuse the normal
+    emoji-quiz keyboard and never emit this callback. To keep startup robust and
+    avoid NameError crashes, this handler gracefully supports the image callback
+    format and stores the answer in the same emoji_quizzes tables.
+    """
+    if not update.callback_query:
+        return
+    q = update.callback_query
+    data = (q.data or '').strip()
+    m = re.match(r'^imgreact:([0-9a-f]{6,16}):(\d+)$', data)
+    if not m:
+        return
+    quiz_id = m.group(1)
+    selected = int(m.group(2))
+    uid = q.from_user.id if q.from_user else 0
+    if not uid:
+        return
+    quiz = emoji_quiz_get(quiz_id)
+    if not quiz:
+        await q.answer('Quiz expired or not found.', show_alert=True)
+        return
+    if emoji_quiz_has_answered(quiz_id, uid):
+        prev = emoji_quiz_user_choice(quiz_id, uid)
+        counts = emoji_quiz_counts(quiz_id)
+        expl = str(quiz.get('explanation', '') or '').strip()
+        if expl:
+            expl = clean_latex(expl)
+        stat_parts = []
+        for i in range(1, 5):
+            stat_parts.append(f"{EMOJI_BUTTONS[i-1]}={counts.get(i,0)}")
+        msg = f"You already answered: {EMOJI_BUTTONS[max(0, prev-1)] if 1 <= prev <= 4 else '-'}\n"
+        correct = int(quiz.get('correct_answer', 0) or 0)
+        if correct > 0:
+            msg += f"Correct: {EMOJI_BUTTONS[max(0, correct-1)]}\n"
+        msg += ' | '.join(stat_parts)
+        if expl:
+            msg += f"\n\n{expl}"
+        await q.answer(msg[:180], show_alert=True)
+        return
+    correct = int(quiz.get('correct_answer', 0) or 0)
+    is_correct = (selected == correct and correct > 0)
+    emoji_quiz_record_answer(quiz_id, uid, selected, is_correct)
+    counts = emoji_quiz_counts(quiz_id)
+    expl = str(quiz.get('explanation', '') or '').strip()
+    if expl:
+        expl = clean_latex(expl)
+    stat_parts = []
+    for i in range(1, 5):
+        stat_parts.append(f"{EMOJI_BUTTONS[i-1]}={counts.get(i,0)}")
+    if is_correct:
+        msg = '🎉 Congratulations!'
+    else:
+        msg = f"❌ Wrong\n✅ Correct: {EMOJI_BUTTONS[max(0, correct-1)] if correct > 0 else '?'}"
+    msg += f"\n{' | '.join(stat_parts)}"
+    if expl:
+        msg += f"\n\n{expl}"
+    await q.answer(msg[:180], show_alert=True)
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     items = buffer_list(uid, limit=99999)
@@ -3687,7 +3843,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # overwrite
         rr = dict(r)
         rr["questions"] = q2.strip()
-        rr["explanation"] = e.strip()
+        rr["explanation"] = (e.strip() if explain_mode_on(uid) else "")
         norm_rows.append(rr)
     rows = norm_rows
     df = pd.DataFrame(rows)
@@ -4191,7 +4347,8 @@ async def cmd_private_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     uid = update.effective_user.id
-
+    if not await enforce_required_memberships(update, context):
+        return
     if is_banned(uid):
         await err(update, "Access Denied", f"You are banned.\nContact: {OWNER_CONTACT}")
         return
@@ -4220,53 +4377,31 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     staff_ids = list_staff_ids()
 
-    name = update.effective_user.first_name or (
-        f"@{update.effective_user.username}" if update.effective_user.username else "User"
-    )
-    who = mention_user(uid, name)
-
     header = (
         f"📩 New Support Message\n"
         f"Ticket: {tid}\n"
-        f"From: {who} | {code(uid)}"
+        f"From: {uid} ({update.effective_user.first_name or ''})"
     )
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 Open Profile", url=f"tg://user?id={uid}")]
-    ])
-
-    delivered_any = False
-
     if text:
-        payload = f"{header}\n\n{h(text)}"
         for sid in staff_ids:
-            okk = await safe_send_text(context.bot, sid, payload, protect=False, reply_markup=kb)
-            delivered_any = delivered_any or okk
+            await safe_send_text(context.bot, sid, f"{header}\n\n{text}", protect=False)
     else:
-        payload = f"{header}\n\n[MEDIA MESSAGE RECEIVED]"
         for sid in staff_ids:
-            okk = await safe_send_text(context.bot, sid, payload, protect=False, reply_markup=kb)
-            delivered_any = delivered_any or okk
+            await safe_send_text(context.bot, sid, f"{header}\n\n[MEDIA MESSAGE RECEIVED]", protect=False)
 
     # Copy replied content to staff (supports all media)
     if replied:
-        copied_any = False
         for sid in staff_ids:
-            okk = await safe_copy_message(
+            await safe_copy_message(
                 context.bot,
                 chat_id=sid,
                 from_chat_id=replied.chat_id,
                 message_id=replied.message_id,
                 protect=False,
             )
-            copied_any = copied_any or okk
-        delivered_any = delivered_any or copied_any
 
-    if not delivered_any:
-        await err(update, "Delivery Failed", "আপনার মেসেজ staff/owner-এর কাছে পৌঁছায়নি। একটু পরে আবার চেষ্টা করুন।")
-        return
-
-    body = "A staff member will respond soon."
+    body = f"Ticket ID: {tid}\nA staff member will respond soon."
     await ok(update, "Message Received", body)
 
 
@@ -4274,16 +4409,21 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /reply <ticket_id> <message>
-    OR reply to any message and run: /reply <ticket_id>
+    OR reply to any support message/card and run /reply <message>
     Supports text + media/files/photos (by replying).
     """
-    if not context.args or not context.args[0].isdigit():
-        await safe_reply(update, usage_box("reply", "<ticket_id> [message]", "Reply to support ticket (or reply to message/file/photo)"))
-        return
-
-    tid = int(context.args[0])
-    text = " ".join(context.args[1:]).strip()
     replied = update.message.reply_to_message if update.message else None
+    tid = None
+    text = ""
+    if context.args and str(context.args[0]).isdigit():
+        tid = int(context.args[0])
+        text = " ".join(context.args[1:]).strip()
+    else:
+        tid = parse_ticket_id_from_any_message(replied)
+        text = " ".join(context.args).strip()
+    if not tid:
+        await safe_reply(update, usage_box("reply", "<ticket_id> [message]", "Reply to support ticket (or reply to support card/media)"))
+        return
 
     if not text:
         text = reply_text_or_caption(update)
@@ -4431,8 +4571,11 @@ async def cmd_banned(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Admin/Owner: any plain text (non-command) gets parsed into buffer.
+    In private chat, if HimusAI mode is ON for admin/owner, buffering is skipped.
     """
     uid = update.effective_user.id
+    if is_private_chat(update) and get_role(uid) in (ROLE_ADMIN, ROLE_OWNER) and solver_mode_on(uid):
+        return
     text = update.message.text or ""
     if not text.strip():
         return
@@ -4717,9 +4860,113 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     db_log("ERROR", "unhandled_exception", {"error": str(context.error)})
 
 
+def _cmdh(command, callback, *args, **kwargs):
+    """CommandHandler wrapper that supports both /command and .command."""
+    try:
+        return CommandHandler(command, callback, *args, prefixes=("/", "."), **kwargs)
+    except TypeError:
+        return CommandHandler(command, callback, *args, **kwargs)
+
+
 # ---------------------------
 # BUILD APP
 # ---------------------------
+
+
+@require_owner
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT user_id, role, first_name, username, is_banned, created_at, last_seen_at FROM users ORDER BY created_at ASC")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    if not rows:
+        await warn(update, "No Users", "No users found.")
+        return
+    import csv, tempfile
+    with tempfile.NamedTemporaryFile('w', suffix='.csv', delete=False, encoding='utf-8-sig', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=['user_id','role','first_name','username','is_banned','created_at','last_seen_at'])
+        w.writeheader(); w.writerows(rows)
+        path = f.name
+    with open(path, 'rb') as rf:
+        await context.bot.send_document(chat_id=update.effective_user.id, document=rf, filename='probaho_users.csv', caption='All started users')
+    with contextlib.suppress(Exception):
+        os.unlink(path)
+
+
+def _required_join_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for r in required_chat_list():
+        title = str(r["title"] or r["chat_id"])
+        cid = int(r["chat_id"])
+        url = None
+        try:
+            if title.startswith("@"):
+                url = f"https://t.me/{title.lstrip('@')}"
+        except Exception:
+            url = None
+        if url:
+            rows.append([InlineKeyboardButton(f"Join {title}", url=url)])
+    rows.append([InlineKeyboardButton("Verify", callback_data="req:verify")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def on_required_verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.callback_query:
+        return
+    q = update.callback_query
+    uid = q.from_user.id if q.from_user else 0
+    if not uid:
+        with contextlib.suppress(Exception):
+            await q.answer("User not found.", show_alert=True)
+        return
+    if is_owner(uid) or is_admin(uid):
+        with contextlib.suppress(Exception):
+            await q.answer("Verified.", show_alert=False)
+        return
+
+    ok, missing = await user_meets_required_memberships(context, uid)
+    if ok:
+        reset_warn_count(uid)
+        with contextlib.suppress(Exception):
+            await q.answer("Verification successful.", show_alert=True)
+        with contextlib.suppress(Exception):
+            if q.message:
+                await q.message.delete()
+        try:
+            chat = q.message.chat_id if q.message else uid
+            body_html = (
+                f"<b>Your Role:</b> <code>{h(get_role(uid))}</code>"
+                f"\n\nUse <code>/help</code> for commands or <code>/commands</code> for a quick list."
+            )
+            msg = ui_box_html(f"Welcome to {BOT_BRAND}", body_html, emoji="👋")
+            await safe_send_text(context.bot, chat, msg)
+        except Exception:
+            pass
+        return
+
+    count = inc_warn_count(uid)
+    if count >= 5:
+        set_ban(uid, True)
+        audit_ban(OWNER_ID, uid, "BAN")
+        with contextlib.suppress(Exception):
+            await q.answer("You are banned for repeated membership violations.", show_alert=True)
+        with contextlib.suppress(Exception):
+            if q.message:
+                await q.message.edit_text(
+                    f"🚫 You are banned from {BOT_BRAND}. Contact: {OWNER_CONTACT}"
+                )
+        return
+
+    names = ", ".join(missing[:10]) if missing else "required channel/group"
+    with contextlib.suppress(Exception):
+        await q.answer(f"Still missing: {names}", show_alert=True)
+    with contextlib.suppress(Exception):
+        if q.message:
+            await q.message.edit_text(
+                f"⚠️ Please join required chats first.\n\nMissing: {names}\nWarning: {count}/5",
+                reply_markup=_required_join_kb()
+            )
+
 def build_app() -> Application:
     db_init()
     builder = ApplicationBuilder().token(BOT_TOKEN)
@@ -4731,58 +4978,59 @@ def build_app() -> Application:
     app = builder.build()
 
     # Public
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("commands", cmd_commands))
-    app.add_handler(CommandHandler("features", cmd_features))
+    app.add_handler(_cmdh("start", cmd_start))
+    app.add_handler(_cmdh("help", cmd_help))
+    app.add_handler(_cmdh("commands", cmd_commands))
+    app.add_handler(_cmdh("features", cmd_features))
     app.add_handler(CallbackQueryHandler(on_solver_callback, pattern=r"^solve:"))
     app.add_handler(CallbackQueryHandler(on_genquiz_callback, pattern=r"^genquiz:"))
-    app.add_handler(CommandHandler("ask", cmd_ask))
-    app.add_handler(CommandHandler("scanhelp", cmd_scanhelp))
-    app.add_handler(CommandHandler("vision_on", cmd_vision_on))
-    app.add_handler(CommandHandler("vision_off", cmd_vision_off))
-    app.add_handler(CommandHandler("solve_on", cmd_solve_on))
-    app.add_handler(CommandHandler("solve_off", cmd_solve_off))
-    app.add_handler(CommandHandler("explain_on", cmd_explain_on))
-    app.add_handler(CommandHandler("explain_off", cmd_explain_off))
+    app.add_handler(_cmdh("ask", cmd_ask))
+    app.add_handler(_cmdh("scanhelp", cmd_scanhelp))
+    app.add_handler(_cmdh("vision_on", cmd_vision_on))
+    app.add_handler(_cmdh("vision_off", cmd_vision_off))
+    app.add_handler(_cmdh("solve_on", cmd_solve_on))
+    app.add_handler(_cmdh("solve_off", cmd_solve_off))
+    app.add_handler(_cmdh("explain_on", cmd_explain_on))
+    app.add_handler(_cmdh("explain_off", cmd_explain_off))
 
     # Owner only
-    app.add_handler(CommandHandler("quizprefix", cmd_quizprefix))
-    app.add_handler(CommandHandler("quizlink", cmd_quizlink))
-    app.add_handler(CommandHandler("addadmin", cmd_addadmin))
-    app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
-    app.add_handler(CommandHandler("grantall", cmd_grantall))
-    app.add_handler(CommandHandler("revokeall", cmd_revokeall))
-    app.add_handler(CommandHandler("grantvision", cmd_grantvision))
-    app.add_handler(CommandHandler("revokevision", cmd_revokevision))
+    app.add_handler(_cmdh("quizprefix", cmd_quizprefix))
+    app.add_handler(_cmdh("quizlink", cmd_quizlink))
+    app.add_handler(_cmdh("addadmin", cmd_addadmin))
+    app.add_handler(_cmdh("removeadmin", cmd_removeadmin))
+    app.add_handler(_cmdh("grantall", cmd_grantall))
+    app.add_handler(_cmdh("revokeall", cmd_revokeall))
+    app.add_handler(_cmdh("grantvision", cmd_grantvision))
+    app.add_handler(_cmdh("revokevision", cmd_revokevision))
 
     # Owner dashboard
-    app.add_handler(CommandHandler("ownerstats", cmd_ownerstats))
+    app.add_handler(_cmdh("ownerstats", cmd_ownerstats))
+    app.add_handler(_cmdh("users", cmd_users))
 
     # Admin/Owner
-    app.add_handler(CommandHandler("filter", cmd_filter))
-    app.add_handler(CommandHandler("done", cmd_done))
-    app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(_cmdh("filter", cmd_filter))
+    app.add_handler(_cmdh("done", cmd_done))
+    app.add_handler(_cmdh("clear", cmd_clear))
 
-    app.add_handler(CommandHandler("addchannel", cmd_addchannel))
-    app.add_handler(CommandHandler("listchannels", cmd_listchannels))
-    app.add_handler(CommandHandler("removechannel", cmd_removechannel))
-    app.add_handler(CommandHandler("setprefix", cmd_setprefix))
-    app.add_handler(CommandHandler("setexplink", cmd_setexplink))
-    app.add_handler(CommandHandler("post", cmd_post))
+    app.add_handler(_cmdh("addchannel", cmd_addchannel))
+    app.add_handler(_cmdh("listchannels", cmd_listchannels))
+    app.add_handler(_cmdh("removechannel", cmd_removechannel))
+    app.add_handler(_cmdh("setprefix", cmd_setprefix))
+    app.add_handler(_cmdh("setexplink", cmd_setexplink))
+    app.add_handler(_cmdh("post", cmd_post))
 
-    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    app.add_handler(CommandHandler("adminpanel", cmd_adminpanel))
+    app.add_handler(_cmdh("broadcast", cmd_broadcast))
+    app.add_handler(_cmdh("adminpanel", cmd_adminpanel))
 
-    app.add_handler(CommandHandler("reply", cmd_reply))
-    app.add_handler(CommandHandler("close", cmd_close))
+    app.add_handler(_cmdh("reply", cmd_reply))
+    app.add_handler(_cmdh("close", cmd_close))
 
-    app.add_handler(CommandHandler("ban", cmd_ban))
-    app.add_handler(CommandHandler("unban", cmd_unban))
-    app.add_handler(CommandHandler("banned", cmd_banned))
+    app.add_handler(_cmdh("ban", cmd_ban))
+    app.add_handler(_cmdh("unban", cmd_unban))
+    app.add_handler(_cmdh("banned", cmd_banned))
 
-    app.add_handler(CommandHandler("private_send", cmd_private_send))
-    app.add_handler(CommandHandler("send_private", cmd_private_send))
+    app.add_handler(_cmdh("private_send", cmd_private_send))
+    app.add_handler(_cmdh("send_private", cmd_private_send))
 
     # Polls, Images & admin parsing (silent for non-admins)
     app.add_handler(MessageHandler(filters.POLL, handle_poll))
@@ -4799,8 +5047,3135 @@ def build_app() -> Application:
     return app
 
 
+
+# ===========================
+# ADVANCED PATCH ADDON
+# ===========================
+
+def mention_user(uid: int, name: str = "User") -> str:
+    return f'<a href="tg://user?id={int(uid)}">{h(name or "User")}</a>'
+
+EMOJI_BUTTONS = ["❤️", "😮", "😢", "🥳", "🔥"]
+
+
+def extra_db_init() -> None:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS required_memberships (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL UNIQUE,
+        title TEXT,
+        chat_type TEXT,
+        added_by INTEGER,
+        created_at TEXT NOT NULL
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS user_warnings (
+        user_id INTEGER PRIMARY KEY,
+        warn_count INTEGER NOT NULL DEFAULT 0,
+        last_warn_at TEXT
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS emoji_quizzes (
+        quiz_id TEXT PRIMARY KEY,
+        channel_chat_id INTEGER NOT NULL,
+        message_id INTEGER,
+        payload_json TEXT NOT NULL,
+        created_by INTEGER,
+        created_at TEXT NOT NULL
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS emoji_quiz_responses (
+        quiz_id TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        selected_option INTEGER NOT NULL,
+        is_correct INTEGER NOT NULL DEFAULT 0,
+        clicked_at TEXT NOT NULL,
+        PRIMARY KEY (quiz_id, user_id)
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def required_chat_add(chat_id: int, title: str, chat_type: str, added_by: int) -> None:
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO required_memberships(chat_id,title,chat_type,added_by,created_at) VALUES (?,?,?,?,?)",
+        (int(chat_id), title or "", chat_type or "", int(added_by), now_iso()),
+    )
+    conn.commit(); conn.close()
+
+
+def required_chat_remove(chat_id: int) -> bool:
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("DELETE FROM required_memberships WHERE chat_id=?", (int(chat_id),))
+    ok = cur.rowcount > 0
+    conn.commit(); conn.close()
+    return ok
+
+
+def required_chat_list() -> List[sqlite3.Row]:
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT * FROM required_memberships ORDER BY id ASC")
+    rows = cur.fetchall(); conn.close()
+    return rows
+
+
+def get_warn_count(user_id: int) -> int:
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT warn_count FROM user_warnings WHERE user_id=?", (int(user_id),))
+    row = cur.fetchone(); conn.close()
+    return int(row["warn_count"] or 0) if row else 0
+
+
+def inc_warn_count(user_id: int) -> int:
+    conn = db_connect(); cur = conn.cursor()
+    current = get_warn_count(user_id)
+    new_count = current + 1
+    cur.execute(
+        "INSERT INTO user_warnings(user_id,warn_count,last_warn_at) VALUES (?,?,?) ON CONFLICT(user_id) DO UPDATE SET warn_count=excluded.warn_count,last_warn_at=excluded.last_warn_at",
+        (int(user_id), new_count, now_iso()),
+    )
+    conn.commit(); conn.close()
+    return new_count
+
+
+def reset_warn_count(user_id: int) -> None:
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("DELETE FROM user_warnings WHERE user_id=?", (int(user_id),))
+    conn.commit(); conn.close()
+
+
+def set_group_ai_enabled(chat_id: int, value: bool) -> None:
+    set_setting(f"group_ai_enabled:{int(chat_id)}", "1" if value else "0")
+
+
+def is_group_ai_enabled(chat_id: int) -> bool:
+    return get_setting(f"group_ai_enabled:{int(chat_id)}", "0") == "1"
+
+
+def is_private_chat(update: Update) -> bool:
+    try:
+        return (update.effective_chat.type == "private")
+    except Exception:
+        return False
+
+
+async def user_meets_required_memberships(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> Tuple[bool, List[str]]:
+    rows = required_chat_list()
+    if not rows:
+        return True, []
+    missing = []
+    for r in rows:
+        cid = int(r["chat_id"])
+        title = str(r["title"] or cid)
+        try:
+            member = await context.bot.get_chat_member(cid, user_id)
+            status = str(getattr(member, "status", ""))
+            if status in ("left", "kicked"):
+                missing.append(title)
+        except Exception:
+            missing.append(title)
+    return (len(missing) == 0), missing
+
+
+async def enforce_required_memberships(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    ensure_user(update)
+    uid = update.effective_user.id if update.effective_user else 0
+    if not uid or is_owner(uid) or is_admin(uid):
+        return True
+    ok, missing = await user_meets_required_memberships(context, uid)
+    if ok:
+        reset_warn_count(uid)
+        return True
+    count = inc_warn_count(uid)
+    if count >= 5:
+        set_ban(uid, True)
+        audit_ban(OWNER_ID, uid, "BAN")
+        with contextlib.suppress(Exception):
+            await safe_send_text(context.bot, uid, f"🚫 You are banned from <b>{h(BOT_BRAND)}</b> for leaving required channel/group. Contact: {h(OWNER_CONTACT)}")
+        return False
+    names = ", ".join(missing[:10]) if missing else "required channel/group"
+    if update.message:
+        await warn(update, "Join Required", f"Please join: {names}\n\nWarning: {count}/5")
+    return False
+
+
+def _copyable_quiz_block(question: str, options: List[str]) -> str:
+    parts = [question.strip(), ""]
+    for i, o in enumerate(options, start=1):
+        parts.append(f"{_safe_letter(i)}) {o}")
+    raw = "\n".join(parts).strip()
+    return f"<pre>{h(raw)}</pre>"
+
+
+def _remember_quiz_context(context: ContextTypes.DEFAULT_TYPE, message_id: int, payload: Dict[str, Any]) -> None:
+    store = context.application.bot_data.get("_quiz_context")
+    if not isinstance(store, dict):
+        store = {}
+        context.application.bot_data["_quiz_context"] = store
+    store[int(message_id)] = dict(payload)
+    if len(store) > 2000:
+        for k in list(store.keys())[:500]:
+            store.pop(k, None)
+
+
+def _get_quiz_context(context: ContextTypes.DEFAULT_TYPE, message_id: int) -> Optional[Dict[str, Any]]:
+    store = context.application.bot_data.get("_quiz_context")
+    if not isinstance(store, dict):
+        return None
+    item = store.get(int(message_id))
+    return item if isinstance(item, dict) else None
+
+
+def emoji_quiz_save(quiz_id: str, channel_chat_id: int, message_id: int, payload: Dict[str, Any], created_by: int) -> None:
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO emoji_quizzes(quiz_id,channel_chat_id,message_id,payload_json,created_by,created_at) VALUES (?,?,?,?,?,?)",
+        (quiz_id, int(channel_chat_id), int(message_id), json.dumps(payload, ensure_ascii=False), int(created_by), now_iso()),
+    )
+    conn.commit(); conn.close()
+
+
+def emoji_quiz_get(quiz_id: str) -> Optional[Dict[str, Any]]:
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT * FROM emoji_quizzes WHERE quiz_id=?", (str(quiz_id),))
+    row = cur.fetchone(); conn.close()
+    if not row:
+        return None
+    data = json.loads(row["payload_json"])
+    data["quiz_id"] = quiz_id
+    data["channel_chat_id"] = int(row["channel_chat_id"])
+    data["message_id"] = int(row["message_id"] or 0)
+    return data
+
+
+def emoji_quiz_has_answered(quiz_id: str, user_id: int) -> bool:
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT 1 FROM emoji_quiz_responses WHERE quiz_id=? AND user_id=?", (str(quiz_id), int(user_id)))
+    row = cur.fetchone(); conn.close()
+    return bool(row)
+
+
+def emoji_quiz_user_choice(quiz_id: str, user_id: int) -> int:
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT selected_option FROM emoji_quiz_responses WHERE quiz_id=? AND user_id=?", (str(quiz_id), int(user_id)))
+    row = cur.fetchone(); conn.close()
+    return int(row["selected_option"] or 0) if row else 0
+
+
+def emoji_quiz_record_answer(quiz_id: str, user_id: int, selected_option: int, is_correct: bool) -> None:
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO emoji_quiz_responses(quiz_id,user_id,selected_option,is_correct,clicked_at) VALUES (?,?,?,?,?)",
+        (str(quiz_id), int(user_id), int(selected_option), 1 if is_correct else 0, now_iso()),
+    )
+    conn.commit(); conn.close()
+
+
+def emoji_quiz_counts(quiz_id: str) -> Dict[int, int]:
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT selected_option, COUNT(*) AS c FROM emoji_quiz_responses WHERE quiz_id=? GROUP BY selected_option", (str(quiz_id),))
+    rows = cur.fetchall(); conn.close()
+    return {int(r["selected_option"]): int(r["c"]) for r in rows}
+
+
+def emoji_quiz_keyboard(num_options: int, quiz_id: str) -> InlineKeyboardMarkup:
+    buttons = []
+    row = []
+    for i in range(num_options):
+        row.append(InlineKeyboardButton(EMOJI_BUTTONS[i], callback_data=f"eq:{quiz_id}:{i+1}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+
+@require_owner
+async def cmd_addrequired(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await safe_reply(update, usage_box("addrequired", "<@channel|group|-100...>", "Add required channel/group for all normal users"))
+        return
+    ref = context.args[0].strip()
+    try:
+        chat = await context.bot.get_chat(int(ref) if ref.lstrip('-').isdigit() else ref)
+        required_chat_add(chat.id, chat.title or chat.username or str(chat.id), getattr(chat, "type", ""), update.effective_user.id)
+        await ok_html(update, "Required Chat Added", f"{h(chat.title or chat.username or chat.id)}\n<code>{h(chat.id)}</code>")
+    except Exception as e:
+        await err(update, "Failed", str(e)[:180])
+
+
+@require_owner
+async def cmd_delrequired(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await safe_reply(update, usage_box("delrequired", "<chat_id>", "Remove required channel/group"))
+        return
+    cid = to_int(context.args[0])
+    if not cid:
+        await err(update, "Invalid Input", "Invalid chat id")
+        return
+    if required_chat_remove(cid):
+        await ok(update, "Removed", f"Required chat removed: {cid}")
+    else:
+        await warn(update, "Not Found", f"Required chat not found: {cid}")
+
+
+@require_owner
+async def cmd_listrequired(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = required_chat_list()
+    if not rows:
+        await warn(update, "No Required Chats", "No required membership configured.")
+        return
+    body = "\n\n".join([f"<b>{h(r['title'] or '')}</b>\n<code>{h(r['chat_id'])}</code>\nType: {h(r['chat_type'] or '')}" for r in rows])
+    await ok_html(update, "Required Memberships", body, emoji="📌")
+
+
+@require_admin
+async def cmd_himusai_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_private_chat(update):
+        await warn(update, "Private Only", "This command works in inbox/private chat only.")
+        return
+    set_himusai_mode_on(update.effective_user.id, True)
+    await ok_html(update, "HimusAI Enabled", "Admin/Owner inbox auto-response enabled.", emoji="🧠")
+
+
+@require_admin
+async def cmd_himusai_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_private_chat(update):
+        await warn(update, "Private Only", "This command works in inbox/private chat only.")
+        return
+    set_himusai_mode_on(update.effective_user.id, False)
+    await ok_html(update, "HimusAI Disabled", "Admin/Owner inbox auto-response disabled.", emoji="🧠")
+
+
+@require_admin
+async def cmd_probaho_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        await warn(update, "Group Only", "Use this command inside a group/supergroup.")
+        return
+    set_group_ai_enabled(chat.id, True)
+    await ok(update, "Group AI Enabled", f"Users can now get AI responses in this group: {chat.id}")
+
+
+@require_admin
+async def cmd_probaho_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        await warn(update, "Group Only", "Use this command inside a group/supergroup.")
+        return
+    set_group_ai_enabled(chat.id, False)
+    await ok(update, "Group AI Disabled", f"Users will no longer get AI responses in this group: {chat.id}")
+
+
+@require_admin
+async def cmd_postemoji(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if not context.args or not context.args[0].isdigit():
+        await safe_reply(update, usage_box("postemoji", "<DB-ID> [keep]", "Post buffered questions as emoji quiz to a channel"))
+        return
+    cid = int(context.args[0])
+    keep = (len(context.args) > 1 and context.args[1].strip().lower() == "keep")
+    ch = channel_get_by_id_for_user(admin_id, cid)
+    if not ch:
+        await warn(update, "Not Found", "Channel not found or no access.")
+        return
+    items = buffer_list(admin_id, limit=MAX_BUFFERED_QUESTIONS)
+    if not items:
+        await warn(update, "Buffer Empty", "No buffered questions found.")
+        return
+    sent = 0
+    sent_ids = []
+    for bid, payload in items:
+        q, opts, corr_idx0, explanation = quiz_to_poll_parts(payload)
+        block = _copyable_quiz_block(q, opts)
+        msg_html = f"<b>📚 Emoji Quiz</b>\n\n{block}"
+        try:
+            m = await context.bot.send_message(chat_id=ch.channel_chat_id, text=msg_html, parse_mode=ParseMode.HTML, reply_markup=emoji_quiz_keyboard(len(opts), uuid.uuid4().hex[:10]), disable_web_page_preview=True)
+            sent += 1
+            sent_ids.append(bid)
+            # fix quiz_id from keyboard callback data
+            quiz_id = None
+            try:
+                quiz_id = m.reply_markup.inline_keyboard[0][0].callback_data.split(":")[1]
+            except Exception:
+                quiz_id = uuid.uuid4().hex[:10]
+            emoji_quiz_save(quiz_id, ch.channel_chat_id, m.message_id, {"question": q, "options": opts, "correct_answer": corr_idx0 + 1 if corr_idx0 >= 0 else 0, "explanation": explanation}, admin_id)
+            await asyncio.sleep(0.25)
+        except Exception as e:
+            db_log("ERROR", "postemoji_failed", {"admin_id": admin_id, "channel": ch.channel_chat_id, "error": str(e)})
+    if sent and not keep:
+        buffer_remove_ids(admin_id, sent_ids)
+    await ok_html(update, "Emoji Quiz Posted", f"Sent: <code>{h(sent)}</code>\nChannel: <code>{h(ch.title)}</code>")
+
+
+async def on_emoji_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.callback_query:
+        return
+    q = update.callback_query
+    data = (q.data or "").strip()
+    m = re.match(r"^eq:([0-9a-f]{6,16}):(\d+)$", data)
+    if not m:
+        return
+    quiz_id = m.group(1)
+    selected = int(m.group(2))
+    uid = q.from_user.id if q.from_user else 0
+    if not uid:
+        return
+    if emoji_quiz_has_answered(quiz_id, uid):
+        await q.answer("আপনি ইতোমধ্যে উত্তর দিয়েছেন।", show_alert=True)
+        return
+    quiz = emoji_quiz_get(quiz_id)
+    if not quiz:
+        await q.answer("Quiz expired or not found.", show_alert=True)
+        return
+    correct = int(quiz.get("correct_answer", 0) or 0)
+    is_correct = (selected == correct and correct > 0)
+    emoji_quiz_record_answer(quiz_id, uid, selected, is_correct)
+    counts = emoji_quiz_counts(quiz_id)
+    opts = quiz.get("options", []) or []
+    stats = []
+    for i, opt in enumerate(opts, start=1):
+        stats.append(f"{_safe_letter(i)}) {opt} — {counts.get(i,0)}")
+    stats_text = "\n".join(stats)
+    expl = str(quiz.get("explanation", "") or "").strip()
+    if expl:
+        expl = clean_latex(expl)
+    if is_correct:
+        msg = f"🎉 Congratulations!\n\n✅ Correct answer: {_safe_letter(correct)}\n\n{expl}\n\nStats:\n{stats_text}".strip()
+    else:
+        msg = f"❌ Wrong answer\n✅ Correct: {_safe_letter(correct)}\n\n{expl}\n\nStats:\n{stats_text}".strip()
+    await q.answer("Answer recorded.", show_alert=False)
+    # Try DM first so only that user sees analysis
+    delivered = False
+    with contextlib.suppress(Exception):
+        await context.bot.send_message(chat_id=uid, text=msg)
+        delivered = True
+    if not delivered:
+        with contextlib.suppress(Exception):
+            await q.answer(msg[:180], show_alert=True)
+
+
+async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    items = buffer_list(uid, limit=99999)
+    if not items:
+        await warn(update, "Buffer Empty", "No questions to export. Use /add or send quizzes first.")
+        return
+    rows = [payload for (_id, payload) in items]
+    norm_rows = []
+    explanations_enabled = explain_mode_on(uid)
+    for r in rows:
+        q = str(r.get("questions", "") or "")
+        e = str(r.get("explanation", "") or "")
+        q2, expl2 = split_inline_explain(q)
+        if expl2 and not e.strip():
+            e = expl2
+        rr = dict(r)
+        rr["questions"] = q2.strip()
+        rr["explanation"] = e.strip() if explanations_enabled else ""
+        norm_rows.append(rr)
+    rows = norm_rows
+    df = pd.DataFrame(rows)
+    cols = ["questions", "option1", "option2", "option3", "option4", "option5", "answer", "explanation", "type", "section"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[cols]
+    with tempfile.NamedTemporaryFile("w+b", suffix=".csv", delete=False) as f:
+        path = f.name
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+    def _ans_to_letter(n: int) -> str:
+        return {1: "A", 2: "B", 3: "C", 4: "D", 5: "E"}.get(int(n or 0), "")
+    quiz_json = []
+    for r in rows:
+        opts_map = {"A": r.get("option1", ""), "B": r.get("option2", ""), "C": r.get("option3", ""), "D": r.get("option4", "")}
+        if str(r.get("option5", "")).strip():
+            opts_map["E"] = r.get("option5", "")
+        quiz_json.append({
+            "question": r.get("questions", ""),
+            "options": opts_map,
+            "correct_answer": _ans_to_letter(r.get("answer", 0)),
+            "explanation": r.get("explanation", "") if explanations_enabled else "",
+        })
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as jf:
+        json_path = jf.name
+        json.dump(quiz_json, jf, ensure_ascii=False, indent=2)
+    try:
+        await update.message.reply_document(document=open(path, "rb"), caption=f"<b>✅ CSV Export</b>\n<i>{len(df)} questions exported</i>", parse_mode=ParseMode.HTML)
+        await update.message.reply_document(document=open(json_path, "rb"), caption="<b>✅ JSON Export</b>", parse_mode=ParseMode.HTML)
+        await ok_html(update, "Export Complete", f"CSV + JSON ready. <code>{h(len(df))}</code> questions exported.")
+    finally:
+        with contextlib.suppress(Exception): os.remove(path)
+        with contextlib.suppress(Exception): os.remove(json_path)
+    buffer_clear(uid)
+
+
+async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    uid = update.effective_user.id
+    if not await enforce_required_memberships(update, context):
+        return
+    if is_banned(uid):
+        await err(update, "Access Denied", f"You are banned.\nContact: {OWNER_CONTACT}")
+        return
+    if not await enforce_required_memberships(update, context):
+        return
+    replied = update.message.reply_to_message if update.message else None
+    text = " ".join(context.args).strip()
+    if not text:
+        text = reply_text_or_caption(update)
+    if not text and not replied:
+        await safe_reply(update, usage_box("ask", "<message>", "Ask a support question (or reply to message/file/photo)"))
+        return
+    tid = ticket_find_open_by_student(uid)
+    if tid is None:
+        tid = ticket_open(uid, update.effective_user.first_name or "")
+        db_log("INFO", "ticket_open", {"ticket_id": tid, "student_id": uid})
+    if text:
+        ticket_add_msg(tid, "STUDENT", uid, text)
+    elif replied:
+        ticket_add_msg(tid, "STUDENT", uid, "[MEDIA MESSAGE]")
+    staff_ids = list_staff_ids()
+    profile = mention_user(uid, update.effective_user.first_name or str(uid))
+    uname = f"@{update.effective_user.username}" if getattr(update.effective_user, 'username', None) else ""
+    header = f"📩 New Support Message\nTicket: <code>{tid}</code>\nFrom: {profile} <code>{uid}</code> {h(uname)}"
+    if text:
+        for sid in staff_ids:
+            await safe_send_text(context.bot, sid, f"{header}\n\n<pre>{h(text)}</pre>")
+    else:
+        for sid in staff_ids:
+            await safe_send_text(context.bot, sid, f"{header}\n\n[MEDIA MESSAGE RECEIVED]")
+    if replied:
+        for sid in staff_ids:
+            await safe_copy_message(context.bot, chat_id=sid, from_chat_id=replied.chat_id, message_id=replied.message_id, protect=False)
+    await ok(update, "Message Received", f"Ticket ID: {tid}\nA staff member will respond soon.")
+
+
+@require_admin
+async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        await safe_reply(update, usage_box("reply", "<ticket_id> [message]", "Reply to support ticket (or reply to message/file/photo)"))
+        return
+    tid = int(context.args[0]); text = " ".join(context.args[1:]).strip(); replied = update.message.reply_to_message if update.message else None
+    if not text:
+        text = reply_text_or_caption(update)
+    tr = ticket_get(tid)
+    if not tr:
+        await warn_html(update, "Ticket Not Found", f"No ticket with ID <code>{h(tid)}</code> found")
+        return
+    if tr["status"] != "OPEN":
+        await err_html(update, "Ticket Closed", f"Ticket <code>{h(tid)}</code> is already <b>CLOSED</b>")
+        return
+    student_id = int(tr["student_id"])
+    if is_banned(student_id):
+        await warn(update, "User Banned", "The user is currently banned.")
+        return
+    sent_any = False
+    if text:
+        ticket_add_msg(tid, "STAFF", update.effective_user.id, text)
+        await safe_send_text(context.bot, student_id, f"💬 Support Reply (Ticket <code>{tid}</code>)\n\n<pre>{h(text)}</pre>")
+        sent_any = True
+    if replied:
+        okc = await safe_copy_message(context.bot, chat_id=student_id, from_chat_id=replied.chat_id, message_id=replied.message_id, protect=False)
+        if okc:
+            ticket_add_msg(tid, "STAFF", update.effective_user.id, "[MEDIA MESSAGE]")
+            sent_any = True
+    if sent_any:
+        await ok_html(update, "Reply Sent", f"<b>Ticket:</b> <code>{h(tid)}</code>\nMessage(s) sent to user.")
+    else:
+        await warn(update, "No Content", "Reply to a message/file/photo or provide text inline")
+
+
+def _format_user_poll_solution(question: str, options: List[str], model_ans: int, official_ans: int, model_expl: str, official_expl: str, why_not: Dict[str, str], conf: int) -> str:
+    opts = [(o or "").strip() for o in (options or []) if (o or "").strip()][:5]
+    copy_block = _copyable_quiz_block(question or "", opts)
+    lines = ["<b>📊 Quiz Solution</b>", "", "<b>Question + Options (copyable):</b>", copy_block]
+    if 1 <= int(model_ans or 0) <= len(opts):
+        lines.append(f"\n<b>✅ AI Response:</b> <b>{_safe_letter(model_ans)}</b>) {h(opts[model_ans-1])}")
+    if official_ans > 0 and official_ans <= len(opts):
+        tag = "✅ Match" if official_ans == model_ans else "❌ Mismatch"
+        lines.append(f"<b>📌 Given Answer:</b> <b>{_safe_letter(official_ans)}</b>) {h(opts[official_ans-1])} <i>({tag})</i>")
+    if model_expl:
+        lines.append(f"\n<b>Explanation (Solved):</b>\n<pre>{h(model_expl)}</pre>")
+    if official_expl:
+        lines.append(f"\n<b>Explanation (From Quiz):</b>\n<pre>{h(official_expl)}</pre>")
+    if why_not:
+        wn = []
+        for k in ["A","B","C","D","E"]:
+            v = (why_not or {}).get(k)
+            if v:
+                wn.append(f"• <b>{h(k)}</b>: {h(v)}")
+        if wn:
+            lines.append("\n<b>Why other options are wrong:</b>\n" + "\n".join(wn))
+    return "\n".join(lines).strip()
+
+
+async def on_solver_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.callback_query:
+        return
+    q = update.callback_query
+    await q.answer("Processing…", show_alert=False)
+    data = (q.data or "").strip()
+    m = re.match(r"^solve:([GPD]):([0-9a-f]{6,16})$", data)
+    if not m:
+        return
+    model = m.group(1); token = m.group(2)
+    store = _pending_store(context); req = store.get(token)
+    if not isinstance(req, dict):
+        with contextlib.suppress(Exception):
+            await q.edit_message_text("⚠️ This request has expired. Please send your question again.")
+        return
+    uid = int(req.get("uid") or 0)
+    if q.from_user and q.from_user.id != uid:
+        with contextlib.suppress(Exception):
+            await q.answer("This is not your request.", show_alert=True)
+        return
+    payload = req.get("payload") or {}
+    problem_text = str(payload.get("text") or "").strip(); kind = str(req.get("kind") or "text").lower()
+    with contextlib.suppress(Exception):
+        await q.edit_message_text(ui_box_text("Solving", "Please wait… Processing your request.", emoji="⏳"), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    try:
+        if kind == "poll" and payload.get("question"):
+            question = str(payload.get("question", "")).strip(); options = payload.get("options", [])
+            if model == "G": result = await _run_blocking(_role_of(uid), gemini_solve_mcq_json, question, options)
+            elif model == "P": result = await _run_blocking(_role_of(uid), perplexity_solve_mcq_json, question, options)
+            else: result = await _run_blocking(_role_of(uid), deepseek_solve_mcq_json, question, options)
+            raw_expl = str(result.get('explanation', '') or ""); clean_expl = clean_latex(raw_expl)
+            raw_why_not = result.get("why_not", {}) or {}; clean_why_not = {k: clean_latex(v) for k, v in raw_why_not.items()}
+            msg_html = _format_user_poll_solution(question=question, options=options, model_ans=int(result.get("answer", 0) or 0), official_ans=int(payload.get("official_ans", 0) or 0), model_expl=f"[{['Gemini', 'Perplexity', 'DeepSeek'][['G','P','D'].index(model)]}]\n{clean_expl}".strip(), official_expl=str(payload.get("official_expl", "")).strip(), why_not=clean_why_not, conf=int(result.get("confidence", 0) or 0))
+            kb = _verify_kb(token, model, "poll")
+        else:
+            if model == "G": answer = await _run_blocking(_role_of(uid), gemini_solve_text, problem_text)
+            elif model == "P": answer = await _run_blocking(_role_of(uid), perplexity_solve_text, problem_text)
+            else: answer = await _run_blocking(_role_of(uid), deepseek_solve_text, problem_text)
+            msg_html = f"<pre>{h(answer)}</pre>"
+            kb = _verify_kb(token, model, "text")
+        with contextlib.suppress(Exception):
+            await q.edit_message_text(msg_html, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            if q.message and kind == "poll":
+                _remember_quiz_context(context, q.message.message_id, payload)
+    except Exception as e:
+        db_log("ERROR", "solver_callback_failed", {"user_id": uid, "model": model, "error": str(e)})
+        with contextlib.suppress(Exception):
+            await q.edit_message_text(ui_box_text("Solve Failed", str(e)[:180], emoji="❌"), parse_mode=ParseMode.HTML)
+
+
+async def send_poll_verify_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE, poll_payload: Dict[str, Any], msg_html: str) -> None:
+    token = _make_token(); store = _pending_store(context); uid = update.effective_user.id
+    store[token] = {"uid": uid, "chat_id": update.effective_chat.id if update.effective_chat else uid, "kind": "poll", "payload": poll_payload}
+    kb = _verify_kb(token, "G", "poll")
+    sent = await update.message.reply_text(msg_html, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    _remember_quiz_context(context, sent.message_id, poll_payload)
+
+
+async def handle_user_poll_solver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    if not update.effective_user or not update.message or not update.message.poll:
+        return
+    uid = update.effective_user.id
+    if is_banned(uid):
+        return
+    if not await enforce_required_memberships(update, context):
+        return
+    role = get_role(uid)
+    private = is_private_chat(update)
+    if role == ROLE_USER:
+        if not solver_mode_on(uid):
+            return
+        if not private and not is_group_ai_enabled(update.effective_chat.id):
+            return
+    elif role in (ROLE_ADMIN, ROLE_OWNER):
+        if not private or not solver_mode_on(uid):
+            return
+    else:
+        return
+    poll = update.message.poll
+    qtext = (poll.question or "").strip(); options = [o.text for o in (poll.options or [])]; options = [x.strip() for x in options if (x or "").strip()]
+    official_expl = str(getattr(poll, "explanation", "") or "").strip(); official_ans = _poll_official_answer(poll)
+    spinner_msg = None; spinner_task = None
+    try:
+        spinner_msg = await update.message.reply_text("🔎 Searching")
+        spinner_task = asyncio.create_task(_spinner_task(context.bot, spinner_msg.chat_id, spinner_msg.message_id))
+        data = await _run_blocking('user', gemini_solve_mcq_json, qtext, options)
+        model_ans = int(data.get("answer", 0) or 0); conf = int(data.get("confidence", 0) or 0)
+        raw_expl = str(data.get("explanation", "") or "").strip(); model_expl = clean_latex(raw_expl)
+        raw_why_not = data.get("why_not", {}) or {}; why_not = {k: clean_latex(v) for k, v in raw_why_not.items()}
+        spinner_task.cancel()
+        with contextlib.suppress(Exception): await context.bot.delete_message(chat_id=spinner_msg.chat_id, message_id=spinner_msg.message_id)
+        msg_html = _format_user_poll_solution(question=qtext, options=options, model_ans=model_ans, official_ans=official_ans, model_expl=f"[Gemini 3 Flash]\n{model_expl}".strip(), official_expl=official_expl, why_not=why_not if isinstance(why_not, dict) else {}, conf=conf)
+        poll_payload = {"question": qtext, "options": options, "official_ans": official_ans, "official_expl": official_expl}
+        await send_poll_verify_buttons(update, context, poll_payload, msg_html)
+    except Exception as e:
+        if spinner_task: spinner_task.cancel()
+        if spinner_msg:
+            with contextlib.suppress(Exception): await context.bot.delete_message(chat_id=spinner_msg.chat_id, message_id=spinner_msg.message_id)
+        db_log("ERROR", "poll_solver_failed", {"user_id": uid, "error": str(e)})
+        await err(update, "Solve Failed", f"{h(str(e)[:160])}")
+
+
+async def handle_user_text_unusual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    uid = update.effective_user.id
+    if is_banned(uid):
+        return
+    if not await enforce_required_memberships(update, context):
+        return
+    role = get_role(uid)
+    private = is_private_chat(update)
+    if role == ROLE_USER:
+        if not solver_mode_on(uid):
+            if private:
+                await warn_unauthorized(update, "This bot is currently restricted for staff operations. Please use /ask [message] for support.")
+            return
+        if not private and not is_group_ai_enabled(update.effective_chat.id):
+            return
+    elif role in (ROLE_ADMIN, ROLE_OWNER):
+        if not private or not solver_mode_on(uid):
+            return
+    else:
+        return
+    user_text = (update.message.text or "").strip()
+    if not user_text:
+        return
+    # If user replied to a previous quiz solution, ask with that quiz context
+    reply_msg = update.message.reply_to_message
+    if reply_msg:
+        ctx = _get_quiz_context(context, reply_msg.message_id)
+        if ctx:
+            qtext = str(ctx.get("question", "") or "").strip()
+            opts = ctx.get("options", []) or []
+            prompt = f"Question:\n{qtext}\n\nOptions:\n" + "\n".join([f"{_safe_letter(i+1)}. {o}" for i,o in enumerate(opts)]) + f"\n\nUser follow-up:\n{user_text}"
+            await send_solver_picker(update, context, prompt)
+            return
+    await send_solver_picker(update, context, user_text)
+
+
+def build_app() -> Application:
+    db_init(); extra_db_init()
+    builder = ApplicationBuilder().token(BOT_TOKEN)
+    try:
+        builder = builder.concurrent_updates(64)
+    except Exception:
+        pass
+    app = builder.build()
+    app.add_handler(_cmdh("start", cmd_start))
+    app.add_handler(_cmdh("help", cmd_help))
+    app.add_handler(_cmdh("commands", cmd_commands))
+    app.add_handler(_cmdh("features", cmd_features))
+    app.add_handler(CallbackQueryHandler(on_solver_callback, pattern=r"^solve:"))
+    app.add_handler(CallbackQueryHandler(on_genquiz_callback, pattern=r"^genquiz:"))
+    app.add_handler(CallbackQueryHandler(on_emoji_quiz_callback, pattern=r"^eq:"))
+    app.add_handler(CallbackQueryHandler(on_required_verify_callback, pattern=r"^req:verify$"))
+    app.add_handler(_cmdh("ask", cmd_ask))
+    app.add_handler(_cmdh("scanhelp", cmd_scanhelp))
+    app.add_handler(_cmdh("vision_on", cmd_vision_on))
+    app.add_handler(_cmdh("vision_off", cmd_vision_off))
+    app.add_handler(_cmdh("solve_on", cmd_solve_on))
+    app.add_handler(_cmdh("solve_off", cmd_solve_off))
+    app.add_handler(_cmdh("himusai_on", cmd_himusai_on))
+    app.add_handler(_cmdh("himusai_off", cmd_himusai_off))
+    app.add_handler(_cmdh("probaho_on", cmd_probaho_on))
+    app.add_handler(_cmdh("probaho_off", cmd_probaho_off))
+    app.add_handler(_cmdh("explain_on", cmd_explain_on))
+    app.add_handler(_cmdh("explain_off", cmd_explain_off))
+    app.add_handler(_cmdh("quizprefix", cmd_quizprefix))
+    app.add_handler(_cmdh("quizlink", cmd_quizlink))
+    app.add_handler(_cmdh("addadmin", cmd_addadmin))
+    app.add_handler(_cmdh("removeadmin", cmd_removeadmin))
+    app.add_handler(_cmdh("grantall", cmd_grantall))
+    app.add_handler(_cmdh("revokeall", cmd_revokeall))
+    app.add_handler(_cmdh("grantvision", cmd_grantvision))
+    app.add_handler(_cmdh("revokevision", cmd_revokevision))
+    app.add_handler(_cmdh("addrequired", cmd_addrequired))
+    app.add_handler(_cmdh("delrequired", cmd_delrequired))
+    app.add_handler(_cmdh("listrequired", cmd_listrequired))
+    app.add_handler(_cmdh("ownerstats", cmd_ownerstats))
+    app.add_handler(_cmdh("users", cmd_users))
+    app.add_handler(_cmdh("filter", cmd_filter))
+    app.add_handler(_cmdh("done", cmd_done))
+    app.add_handler(_cmdh("clear", cmd_clear))
+    app.add_handler(_cmdh("addchannel", cmd_addchannel))
+    app.add_handler(_cmdh("listchannels", cmd_listchannels))
+    app.add_handler(_cmdh("removechannel", cmd_removechannel))
+    app.add_handler(_cmdh("setprefix", cmd_setprefix))
+    app.add_handler(_cmdh("setexplink", cmd_setexplink))
+    app.add_handler(_cmdh("post", cmd_post))
+    app.add_handler(_cmdh("postemoji", cmd_postemoji))
+    app.add_handler(_cmdh("broadcast", cmd_broadcast))
+    app.add_handler(_cmdh("adminpanel", cmd_adminpanel))
+    app.add_handler(_cmdh("reply", cmd_reply))
+    app.add_handler(_cmdh("close", cmd_close))
+    app.add_handler(_cmdh("ban", cmd_ban))
+    app.add_handler(_cmdh("unban", cmd_unban))
+    app.add_handler(_cmdh("banned", cmd_banned))
+    app.add_handler(_cmdh("private_send", cmd_private_send))
+    app.add_handler(_cmdh("send_private", cmd_private_send))
+    app.add_handler(MessageHandler(filters.POLL, handle_poll))
+    app.add_handler(MessageHandler(filters.POLL, handle_user_poll_solver), group=1)
+    app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_image))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_user_text_unusual), group=1)
+    app.add_error_handler(on_error)
+    return app
+
+
+# ===========================
+# FINAL PATCH OVERRIDES
+# ===========================
+REQUIRED_DEFAULT_JOIN_URL = "https://t.me/FX_Ur_Target"
+
+async def _is_group_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        return str(getattr(member, "status", "")) in ("administrator", "creator")
+    except Exception:
+        return False
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT user_id, role, first_name, username, is_banned, created_at, last_seen_at FROM users ORDER BY created_at ASC")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    if not rows:
+        await warn(update, "No Users", "No users found.")
+        return
+    import tempfile, json
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+        path = f.name
+    with open(path, "rb") as rf:
+        await context.bot.send_document(chat_id=update.effective_user.id, document=rf, filename="probaho_users.json", caption="All started users")
+    with contextlib.suppress(Exception):
+        os.unlink(path)
+
+def _required_join_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for r in required_chat_list():
+        title = str(r["title"] or r["chat_id"])
+        if title.startswith("@"):
+            url = f"https://t.me/{title.lstrip('@')}"
+        elif "t.me/" in title:
+            url = title if title.startswith("http") else ("https://" + title.lstrip("/"))
+        else:
+            url = REQUIRED_DEFAULT_JOIN_URL
+        rows.append([InlineKeyboardButton(f"Join {title}", url=url)])
+    rows.append([InlineKeyboardButton("Verify", callback_data="req:verify")])
+    return InlineKeyboardMarkup(rows)
+
+async def enforce_required_memberships(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    ensure_user(update)
+    uid = update.effective_user.id if update.effective_user else 0
+    if not uid or is_owner(uid) or is_admin(uid):
+        return True
+    ok, missing = await user_meets_required_memberships(context, uid)
+    if ok:
+        reset_warn_count(uid)
+        return True
+    count = inc_warn_count(uid)
+    if count >= 5:
+        set_ban(uid, True)
+        audit_ban(OWNER_ID, uid, "BAN")
+        with contextlib.suppress(Exception):
+            await safe_send_text(context.bot, uid, f"🚫 You are banned from <b>{h(BOT_BRAND)}</b> for leaving required channel/group. Contact: {h(OWNER_CONTACT)}")
+        return False
+    names = ", ".join(missing[:10]) if missing else "required channel/group"
+    if update.message:
+        try:
+            await update.message.reply_text(f"⚠️ Join Required\nPlease join: {names}\nWarning: {count}/5", reply_markup=_required_join_kb())
+        except Exception:
+            await warn(update, "Join Required", f"Please join: {names}\n\nWarning: {count}/5")
+    return False
+
+@require_owner
+async def cmd_addrequired(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await safe_reply(update, usage_box("addrequired", "<@channel|group|-100...>", "Add required channel/group for all normal users"))
+        return
+    ref = context.args[0].strip()
+    try:
+        chat = await context.bot.get_chat(int(ref) if ref.lstrip("-").isdigit() else ref)
+        title = ("@" + chat.username) if getattr(chat, "username", None) else (chat.title or str(chat.id))
+        required_chat_add(chat.id, title, getattr(chat, "type", ""), update.effective_user.id)
+        await ok_html(update, "Required Chat Added", f"{h(title)}\n<code>{h(chat.id)}</code>")
+    except Exception as e:
+        await err(update, "Failed", str(e)[:180])
+
+async def cmd_probaho_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    uid = update.effective_user.id if update.effective_user else 0
+    if not chat or chat.type not in ("group", "supergroup"):
+        await warn(update, "Group Only", "Use this command inside a group/supergroup.")
+        return
+    if not await _is_group_admin(context, chat.id, uid):
+        await warn(update, "Unauthorized", "Only a group admin can use this command.")
+        return
+    set_group_ai_enabled(chat.id, True)
+    await ok(update, "Group AI Enabled", f"Users can now get AI responses in this group: {chat.id}")
+
+async def cmd_probaho_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    uid = update.effective_user.id if update.effective_user else 0
+    if not chat or chat.type not in ("group", "supergroup"):
+        await warn(update, "Group Only", "Use this command inside a group/supergroup.")
+        return
+    if not await _is_group_admin(context, chat.id, uid):
+        await warn(update, "Unauthorized", "Only a group admin can use this command.")
+        return
+    set_group_ai_enabled(chat.id, False)
+    await ok(update, "Group AI Disabled", f"Users will no longer get AI responses in this group: {chat.id}")
+
+def _copyable_quiz_block(question: str, options: List[str], labels: Optional[List[str]] = None) -> str:
+    parts = [question.strip(), ""]
+    labs = labels or []
+    for i, o in enumerate(options, start=1):
+        label = labs[i-1] if i-1 < len(labs) else f"{_safe_letter(i)})"
+        parts.append(f"{label} {o}")
+    raw = "\n".join(parts).strip()
+    return f"<pre>{h(raw)}</pre>"
+
+@require_admin
+async def cmd_postemoji(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if not context.args or not context.args[0].isdigit():
+        await safe_reply(update, usage_box("postemoji", "<DB-ID> [keep]", "Post buffered questions as emoji quiz to a channel"))
+        return
+    cid = int(context.args[0])
+    keep = (len(context.args) > 1 and context.args[1].strip().lower() == "keep")
+    ch = channel_get_by_id_for_user(admin_id, cid)
+    if not ch:
+        await warn(update, "Not Found", "Channel not found or no access.")
+        return
+    items = buffer_list(admin_id, limit=MAX_BUFFERED_QUESTIONS)
+    if not items:
+        await warn(update, "Buffer Empty", "No buffered questions found.")
+        return
+    sent = 0; sent_ids = []
+    try:
+        prefix = str(ch["prefix"] or "").strip()
+    except Exception:
+        prefix = ""
+    for bid, payload in items:
+        q, opts, corr_idx0, explanation = quiz_to_poll_parts(payload)
+        labels = EMOJI_BUTTONS[:len(opts)]
+        block = _copyable_quiz_block(q, opts, labels=labels)
+        title = prefix if prefix else "Emoji Quiz"
+        msg_html = f"<b>{h(title)}</b>\n\n{block}"
+        quiz_id = uuid.uuid4().hex[:10]
+        try:
+            m = await context.bot.send_message(chat_id=ch.channel_chat_id, text=msg_html, parse_mode=ParseMode.HTML, reply_markup=emoji_quiz_keyboard(len(opts), quiz_id), disable_web_page_preview=True)
+            sent += 1; sent_ids.append(bid)
+            emoji_quiz_save(quiz_id, ch.channel_chat_id, m.message_id, {"question": q, "options": opts, "correct_answer": corr_idx0 + 1 if corr_idx0 >= 0 else 0, "explanation": explanation, "prefix": title}, admin_id)
+            await asyncio.sleep(0.25)
+        except Exception as e:
+            db_log("ERROR", "postemoji_failed", {"admin_id": admin_id, "channel": ch.channel_chat_id, "error": str(e)})
+    if sent and not keep:
+        buffer_remove_ids(admin_id, sent_ids)
+    await ok_html(update, "Emoji Quiz Posted", f"Sent: <code>{h(sent)}</code>\nChannel: <code>{h(ch.title)}</code>")
+
+async def on_emoji_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.callback_query:
+        return
+    q = update.callback_query
+    data = (q.data or "").strip()
+    m = re.match(r"^eq:([0-9a-f]{6,16}):(\d+)$", data)
+    if not m:
+        return
+    quiz_id = m.group(1)
+    selected = int(m.group(2))
+    uid = q.from_user.id if q.from_user else 0
+    if not uid:
+        return
+    ok, _missing = await user_meets_required_memberships(context, uid)
+    if not ok:
+        await q.answer("Join required channel first.", show_alert=True)
+        return
+    quiz = emoji_quiz_get(quiz_id)
+    if not quiz:
+        await q.answer("Quiz expired or not found.", show_alert=True)
+        return
+    if not emoji_quiz_has_answered(quiz_id, uid):
+        correct = int(quiz.get("correct_answer", 0) or 0)
+        emoji_quiz_record_answer(quiz_id, uid, selected, (selected == correct and correct > 0))
+    selected = emoji_quiz_user_choice(quiz_id, uid) or selected
+    correct = int(quiz.get("correct_answer", 0) or 0)
+    counts = emoji_quiz_counts(quiz_id)
+    opts = quiz.get("options", []) or []
+    stats = []
+    for i, opt in enumerate(opts, start=1):
+        label = EMOJI_BUTTONS[i-1] if i-1 < len(EMOJI_BUTTONS) else _safe_letter(i)
+        stats.append(f"{label} {opt} — {counts.get(i,0)}")
+    stats_text = "\n".join(stats)
+    expl = clean_latex(str(quiz.get("explanation", "") or "").strip())
+    if selected == correct and correct > 0:
+        msg = f"✅ Correct\n{expl}\n\nStats:\n{stats_text}".strip()
+    else:
+        corr_label = EMOJI_BUTTONS[correct-1] if 0 < correct <= len(EMOJI_BUTTONS) else _safe_letter(correct)
+        msg = f"❌ Wrong\n✅ Correct: {corr_label}\n{expl}\n\nStats:\n{stats_text}".strip()
+    await q.answer(msg[:190], show_alert=True)
+
+
+# ===========================
+# STRONG FIX OVERRIDES (GPT)
+# ===========================
+USE_OFFICIAL_GEMINI_REST_FALLBACK = False
+USE_GEMINI_REST_FOR_GENQUIZ = False
+REQUIRED_DEFAULT_JOIN_URL = "https://t.me/FX_Ur_Target"
+REQUIRED_DEFAULT_CHAT_USERNAME = "@FX_Ur_Target"
+REQUIRED_DEFAULT_CHAT_TITLE = "✨TARGET🎯"
+
+
+def _effective_required_targets() -> List[Dict[str, Any]]:
+    rows = required_chat_list()
+    targets: List[Dict[str, Any]] = []
+    has_default = False
+    for r in rows:
+        try:
+            cid = int(r["chat_id"])
+        except Exception:
+            continue
+        title = str(r["title"] or cid)
+        tl = title.lower()
+        if "fx_ur_target" in tl:
+            has_default = True
+        if title.startswith("@"):
+            url = f"https://t.me/{title.lstrip('@')}"
+        elif "t.me/" in title:
+            url = title if title.startswith("http") else ("https://" + title.lstrip("/"))
+        else:
+            url = REQUIRED_DEFAULT_JOIN_URL
+        targets.append({"chat_id": cid, "title": title, "url": url})
+    if not has_default:
+        targets.insert(0, {
+            "chat_id": REQUIRED_DEFAULT_CHAT_USERNAME,
+            "title": REQUIRED_DEFAULT_CHAT_TITLE,
+            "url": REQUIRED_DEFAULT_JOIN_URL,
+        })
+    return targets
+
+
+def _required_join_kb() -> InlineKeyboardMarkup:
+    rows = []
+    targets = _effective_required_targets()
+    for i, t in enumerate(targets[:8]):
+        title = str(t.get("title") or "Channel")
+        label = "Join Channel" if i == 0 else f"Join {title}"
+        rows.append([InlineKeyboardButton(label, url=str(t.get("url") or REQUIRED_DEFAULT_JOIN_URL))])
+    rows.append([InlineKeyboardButton("✅ Verify", callback_data="req:verify")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _warn_count_or_increment(user_id: int, *, throttle_seconds: int = 45) -> int:
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT warn_count, last_warn_at FROM user_warnings WHERE user_id=?", (int(user_id),))
+    row = cur.fetchone(); conn.close()
+    if row and row["last_warn_at"]:
+        try:
+            last = dt.datetime.fromisoformat(str(row["last_warn_at"]))
+            now = dt.datetime.now(last.tzinfo or dt.timezone.utc)
+            if abs((now - last).total_seconds()) <= throttle_seconds:
+                return int(row["warn_count"] or 0)
+        except Exception:
+            pass
+    return inc_warn_count(user_id)
+
+
+async def _send_join_required_message(update: Update, context: ContextTypes.DEFAULT_TYPE, missing: List[str], count: int) -> None:
+    names = ", ".join(missing[:10]) if missing else REQUIRED_DEFAULT_CHAT_TITLE
+    msg = ui_box_text("Join Required", f"Please join: {names}\nWarning: {count}/5", emoji="⚠️")
+    if update.message:
+        old_mid = None
+        try:
+            old_mid = context.user_data.get("_req_prompt_mid")
+        except Exception:
+            old_mid = None
+        if old_mid:
+            with contextlib.suppress(Exception):
+                await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=int(old_mid))
+        try:
+            sent = await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=_required_join_kb(), disable_web_page_preview=True)
+            try:
+                context.user_data["_req_prompt_mid"] = sent.message_id
+            except Exception:
+                pass
+            return
+        except Exception:
+            pass
+    if update.callback_query and update.callback_query.message:
+        with contextlib.suppress(Exception):
+            await update.callback_query.message.edit_text(msg, parse_mode=ParseMode.HTML, reply_markup=_required_join_kb(), disable_web_page_preview=True)
+            return
+    if update.effective_user:
+        await safe_send_text(context.bot, update.effective_user.id, msg, reply_markup=_required_join_kb())
+
+
+async def user_meets_required_memberships(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> Tuple[bool, List[str]]:
+    targets = _effective_required_targets()
+    if not targets:
+        return True, []
+    missing: List[str] = []
+    for t in targets:
+        cid = t.get("chat_id")
+        title = str(t.get("title") or cid)
+        try:
+            member = await context.bot.get_chat_member(cid, int(user_id))
+            status = str(getattr(member, "status", "")).lower()
+            if status in ("left", "kicked"):
+                missing.append(title)
+        except Exception:
+            missing.append(title)
+    return (len(missing) == 0), missing
+
+
+async def enforce_required_memberships(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    ensure_user(update)
+    uid = update.effective_user.id if update.effective_user else 0
+    if not uid or is_owner(uid) or is_admin(uid):
+        return True
+    ok, missing = await user_meets_required_memberships(context, uid)
+    if ok:
+        reset_warn_count(uid)
+        return True
+    count = _warn_count_or_increment(uid)
+    if count >= 5:
+        set_ban(uid, True)
+        audit_ban(OWNER_ID, uid, "BAN")
+        with contextlib.suppress(Exception):
+            await safe_send_text(context.bot, uid, f"🚫 You are banned from <b>{h(BOT_BRAND)}</b> for leaving required channel/group. Contact: {h(OWNER_CONTACT)}")
+        return False
+    await _send_join_required_message(update, context, missing, count)
+    return False
+
+
+async def on_required_verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.callback_query:
+        return
+    q = update.callback_query
+    uid = q.from_user.id if q.from_user else 0
+    if not uid:
+        with contextlib.suppress(Exception):
+            await q.answer("User not found.", show_alert=True)
+        return
+    if is_owner(uid) or is_admin(uid):
+        with contextlib.suppress(Exception):
+            await q.answer("Verified.", show_alert=False)
+        return
+    ok, missing = await user_meets_required_memberships(context, uid)
+    if ok:
+        reset_warn_count(uid)
+        with contextlib.suppress(Exception):
+            await q.answer("Verification successful.", show_alert=True)
+        with contextlib.suppress(Exception):
+            if q.message:
+                await q.message.delete()
+        try:
+            body_html = (
+                f"<b>Your Role:</b> <code>{h(get_role(uid))}</code>"
+                f"\n\nUse <code>/help</code> for commands or <code>/commands</code> for a quick list."
+            )
+            msg = ui_box_html(f"Welcome to {BOT_BRAND}", body_html, emoji="👋")
+            await safe_send_text(context.bot, uid, msg)
+        except Exception:
+            pass
+        return
+    count = _warn_count_or_increment(uid)
+    with contextlib.suppress(Exception):
+        await q.answer("Still not joined. Please join first.", show_alert=True)
+    if count >= 5:
+        set_ban(uid, True)
+        audit_ban(OWNER_ID, uid, "BAN")
+        with contextlib.suppress(Exception):
+            if q.message:
+                await q.message.edit_text(f"🚫 You are banned from {BOT_BRAND}. Contact: {OWNER_CONTACT}")
+        return
+    await _send_join_required_message(update, context, missing, count)
+
+
+def _all_commands_for(uid: int) -> List[Tuple[str, List[Tuple[str, str]]]]:
+    role = get_role(uid)
+    sections: List[Tuple[str, List[Tuple[str, str]]]] = []
+    user_cmds = [
+        ("/start", "Welcome / membership check"),
+        ("/help", "Detailed guide"),
+        ("/commands", "All commands list"),
+        ("/ask", "Contact support"),
+        ("/solve_on", "Enable AI solving"),
+        ("/solve_off", "Disable AI solving"),
+    ]
+    if can_use_vision(uid):
+        user_cmds += [
+            ("/scanhelp", "Image-to-quiz guide"),
+            ("/vision_on", "Enable image extraction"),
+            ("/vision_off", "Disable image extraction"),
+        ]
+    sections.append(("👤 User Commands", user_cmds))
+    if role in (ROLE_ADMIN, ROLE_OWNER):
+        admin_cmds = [
+            ("/filter", "Add parser filter text"),
+            ("/done", "Export CSV + JSON, then clear buffer"),
+            ("/clear", "Clear buffer"),
+            ("/addchannel", "Add target channel"),
+            ("/listchannels", "List available channels"),
+            ("/removechannel", "Remove a channel"),
+            ("/setprefix", "Set channel prefix"),
+            ("/setexplink", "Set explanation link"),
+            ("/post", "Post normal quizzes"),
+            ("/postemoji", "Post emoji quizzes"),
+            ("/broadcast", "Broadcast message to users"),
+            ("/adminpanel", "Posting stats"),
+            ("/reply", "Reply to support ticket"),
+            ("/close", "Close support ticket"),
+            ("/ban", "Ban a user"),
+            ("/unban", "Unban a user"),
+            ("/banned", "View bans"),
+            ("/private_send", "Send private message to a user"),
+            ("/send_private", "Alias of /private_send"),
+            ("/himusai_on", "Enable admin inbox AI-only mode"),
+            ("/himusai_off", "Disable admin inbox AI-only mode"),
+            ("/probaho_on", "Enable group user AI"),
+            ("/probaho_off", "Disable group user AI"),
+            ("/explain_on", "Enable explanation in quiz + export"),
+            ("/explain_off", "Disable explanation in quiz + export"),
+            ("/quizprefix", "Set generated quiz prefix"),
+            ("/quizlink", "Set generated quiz link"),
+        ]
+        sections.append(("🛠 Staff Commands", admin_cmds))
+    if role == ROLE_OWNER:
+        owner_cmds = [
+            ("/addadmin", "Promote a user to admin"),
+            ("/removeadmin", "Remove admin role"),
+            ("/grantall", "Grant admin all-channel access"),
+            ("/revokeall", "Revoke all-channel access"),
+            ("/grantvision", "Grant image extraction access"),
+            ("/revokevision", "Revoke image extraction access"),
+            ("/addrequired", "Add required channel/group"),
+            ("/delrequired", "Remove required channel/group"),
+            ("/listrequired", "List required channels/groups"),
+            ("/ownerstats", "Owner dashboard"),
+            ("/users", "Export started users JSON"),
+        ]
+        sections.append(("👑 Owner Commands", owner_cmds))
+    return sections
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    uid = update.effective_user.id
+    if not await enforce_required_memberships(update, context):
+        return
+    if is_banned(uid):
+        await err(update, "Access Denied", f"You are banned.\n\nContact: {OWNER_CONTACT}")
+        return
+    sections = _all_commands_for(uid)
+    blocks = [ui_box_html(f"{BOT_BRAND} — Command Guide", f"Owner: {h(OWNER_CONTACT)}\nUse only the commands available for your role.", emoji="📚")]
+    for title, items in sections:
+        body = "\n".join([f"<code>{h(cmd)}</code> — {h(desc)}" for cmd, desc in items])
+        blocks.append(ui_box_html(title, body, emoji="•"))
+    await safe_reply(update, "\n\n".join(blocks))
+
+
+async def cmd_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    uid = update.effective_user.id
+    if not await enforce_required_memberships(update, context):
+        return
+    if is_banned(uid):
+        await err(update, "Access Denied", f"You are banned.\n\nContact: {OWNER_CONTACT}")
+        return
+    sections = _all_commands_for(uid)
+    parts = [ui_box_html("All Available Commands", "Choose a command below.", emoji="📋")]
+    for title, items in sections:
+        body = "\n".join([f"<code>{h(cmd)}</code> — {h(desc)}" for cmd, desc in items])
+        parts.append(ui_box_html(title, body, emoji="👤" if "User" in title else ("🛠" if "Staff" in title else "👑")))
+    await safe_reply(update, "\n\n".join(parts))
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    uid = update.effective_user.id if update.effective_user else 0
+    if not await enforce_required_memberships(update, context):
+        return
+    if is_banned(uid):
+        await err(update, "Access Denied", f"You are banned.\n\nContact: {OWNER_CONTACT}")
+        return
+    role = get_role(uid)
+    body_html = (
+        f"<b>Your Role:</b> <code>{h(role)}</code>"
+        f"\n\nUse <code>/help</code> for commands or <code>/commands</code> for a quick list."
+    )
+    msg = ui_box_html(f"Welcome to {BOT_BRAND}", body_html, emoji="👋")
+    await safe_reply(update, msg)
+
+
+async def cmd_solve_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    uid = update.effective_user.id
+    if not await enforce_required_memberships(update, context):
+        return
+    if is_banned(uid):
+        await err(update, "Access Denied", f"You are banned.\n\nContact: {OWNER_CONTACT}")
+        return
+    if get_role(uid) != ROLE_USER:
+        await warn(update, "Not Available", "Problem-solving chat is intended for normal users. Admin/Owner workflow should remain unchanged.")
+        return
+    set_solver_mode_on(uid, True)
+    await ok_html(update, "Solver Enabled", "Now just send your question as text and the bot will reply with a solved explanation.\n\nTurn off anytime using <code>/solve_off</code>.", emoji="🧠")
+
+
+async def cmd_solve_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    uid = update.effective_user.id
+    if not await enforce_required_memberships(update, context):
+        return
+    if is_banned(uid):
+        await err(update, "Access Denied", f"You are banned.\n\nContact: {OWNER_CONTACT}")
+        return
+    if get_role(uid) != ROLE_USER:
+        await warn(update, "Not Available", "Problem-solving chat is intended for normal users.")
+        return
+    set_solver_mode_on(uid, False)
+    await ok_html(update, "Solver Disabled", "The bot will no longer auto-solve your text messages.", emoji="🧠")
+
+
+def _extract_ticket_id_from_message(msg) -> Optional[int]:
+    if not msg:
+        return None
+    texts = []
+    for attr in ("text", "caption"):
+        val = getattr(msg, attr, None)
+        if val:
+            texts.append(str(val))
+    if not texts:
+        return None
+    blob = "\n".join(texts)
+    m = re.search(r"Ticket\s*:?\s*(\d+)", blob, re.I)
+    if not m:
+        m = re.search(r"Ticket\s*ID\s*:?\s*(\d+)", blob, re.I)
+    return int(m.group(1)) if m else None
+
+
+async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    uid = update.effective_user.id
+    if not await enforce_required_memberships(update, context):
+        return
+    if is_banned(uid):
+        await err(update, "Access Denied", f"You are banned.\nContact: {OWNER_CONTACT}")
+        return
+    replied = update.message.reply_to_message if update.message else None
+    text = " ".join(context.args).strip()
+    if not text:
+        text = reply_text_or_caption(update)
+    if not text and not replied:
+        await safe_reply(update, usage_box("ask", "<message>", "Ask a support question (or reply to message/file/photo)"))
+        return
+    tid = ticket_find_open_by_student(uid)
+    if tid is None:
+        tid = ticket_open(uid, update.effective_user.first_name or "")
+        db_log("INFO", "ticket_open", {"ticket_id": tid, "student_id": uid})
+    if text:
+        ticket_add_msg(tid, "STUDENT", uid, text)
+    elif replied:
+        ticket_add_msg(tid, "STUDENT", uid, "[MEDIA MESSAGE]")
+    staff_ids = list_staff_ids()
+    profile = mention_user(uid, update.effective_user.first_name or str(uid))
+    uname = f"@{update.effective_user.username}" if getattr(update.effective_user, 'username', None) else ""
+    header = f"📩 New Support Message\nTicket: {tid}\nFrom: {profile} | <code>{uid}</code> {h(uname)}"
+    if text:
+        for sid in staff_ids:
+            body = f"{header}\n\n{h(text)}"
+            await safe_send_text(context.bot, sid, body)
+    else:
+        for sid in staff_ids:
+            await safe_send_text(context.bot, sid, f"{header}\n\n[MEDIA MESSAGE RECEIVED]")
+    if replied:
+        for sid in staff_ids:
+            await safe_copy_message(context.bot, chat_id=sid, from_chat_id=replied.chat_id, message_id=replied.message_id, protect=False)
+    await ok(update, "Message Received", "A staff member will respond soon.")
+
+
+@require_admin
+async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    replied = update.message.reply_to_message if update.message else None
+    tid = None
+    if context.args and str(context.args[0]).isdigit():
+        tid = int(context.args[0])
+        text = " ".join(context.args[1:]).strip()
+    else:
+        tid = _extract_ticket_id_from_message(replied)
+        text = " ".join(context.args).strip()
+    if tid is None:
+        await safe_reply(update, usage_box("reply", "<ticket_id> [message]", "Reply to support ticket, or reply to the support card and use /reply [message]"))
+        return
+    if not text:
+        text = reply_text_or_caption(update)
+    tr = ticket_get(int(tid))
+    if not tr:
+        await warn_html(update, "Ticket Not Found", f"No ticket with ID <code>{h(tid)}</code> found")
+        return
+    if tr["status"] != "OPEN":
+        await err_html(update, "Ticket Closed", f"Ticket <code>{h(tid)}</code> is already <b>CLOSED</b>")
+        return
+    student_id = int(tr["student_id"])
+    if is_banned(student_id):
+        await warn(update, "User Banned", "The user is currently banned.")
+        return
+    sent_any = False
+    if text:
+        ticket_add_msg(int(tid), "STAFF", update.effective_user.id, text)
+        if looks_like_programming_request(text):
+            await safe_send_text(context.bot, student_id, f"💬 Support Reply\n\n<pre>{h(text)}</pre>")
+        else:
+            await safe_send_text(context.bot, student_id, f"💬 Support Reply\n\n{h(text)}")
+        sent_any = True
+    if replied and getattr(replied, 'message_id', None):
+        okc = await safe_copy_message(context.bot, chat_id=student_id, from_chat_id=replied.chat_id, message_id=replied.message_id, protect=False)
+        if okc:
+            ticket_add_msg(int(tid), "STAFF", update.effective_user.id, "[MEDIA MESSAGE]")
+            sent_any = True
+    if sent_any:
+        await ok_html(update, "Reply Sent", f"<b>Ticket:</b> <code>{h(tid)}</code>\nMessage(s) sent to user.")
+    else:
+        await warn(update, "No Content", "Reply to a message/file/photo or provide text inline")
+
+
+@require_owner
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT user_id, role, first_name, username, is_banned, created_at, last_seen_at FROM users ORDER BY created_at ASC")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    if not rows:
+        await warn(update, "No Users", "No users found.")
+        return
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+        path = f.name
+    try:
+        with open(path, "rb") as rf:
+            await context.bot.send_document(chat_id=update.effective_user.id, document=rf, filename="probaho_users.json", caption="All started users")
+    finally:
+        with contextlib.suppress(Exception):
+            os.unlink(path)
+
+
+def gemini_solve_text(problem_text: str) -> str:
+    prompt = (STRICT_SYSTEM_PROMPT + "\n\nUser Message:\n" + (problem_text or "").strip()).strip()
+    last_err = None
+    try:
+        out = gemini3_solve(prompt)
+        if out and str(out).strip():
+            return str(out).strip()
+    except Exception as e:
+        last_err = e
+    if USE_PERPLEXITY_FALLBACK:
+        try:
+            alt = query_ai(prompt)
+            if alt:
+                return alt.strip()
+        except Exception as e:
+            last_err = e
+    if USE_OFFICIAL_GEMINI_REST_FALLBACK and GEMINI_API_KEY:
+        try:
+            return call_gemini_text_rest(prompt, timeout_seconds=18).strip()
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Solver failed: {str(last_err)[:120] if last_err else 'all backends unavailable'}")
+
+
+def _infer_option_from_text(text: str, n: int) -> int:
+    s = (text or "").upper()
+    patterns = [
+        r"FINAL ANSWER\s*[:\-]\s*([A-E])",
+        r"CORRECT ANSWER\s*[:\-]\s*([A-E])",
+        r"ANSWER\s*[:\-]\s*([A-E])",
+        r"OPTION\s*([A-E])",
+        r"\(([A-E])\)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, s)
+        if m:
+            idx = ord(m.group(1)) - 64
+            if 1 <= idx <= n:
+                return idx
+    return 0
+
+
+def gemini_solve_mcq_json(question: str, options: List[str]) -> Dict[str, Any]:
+    q = (question or "").strip()
+    opts = [(o or "").strip() for o in (options or []) if (o or "").strip()][:5]
+    if len(opts) < 2:
+        raise ValueError("Not enough options to solve.")
+    opt_lines = "\n".join([f"{_safe_letter(i+1)}. {opts[i]}" for i in range(len(opts))])
+    prompt = (
+        "Return STRICT JSON only. No markdown. No extra text.\n\n"
+        "Task: Solve the following MCQ and pick the correct option.\n"
+        "Rules:\n"
+        "- answer must be 1-5 (A=1,B=2,C=3,D=4,E=5). If unsure, pick the best option.\n"
+        "- explanation: clear exam-style explanation.\n"
+        "- why_not: short reason for wrong options.\n"
+        "- confidence: 0-100 integer.\n\n"
+        f"Question:\n{q}\n\nOptions:\n{opt_lines}\n\n"
+        "JSON format:\n"
+        "{\"answer\":1,\"confidence\":0,\"explanation\":\"...\",\"why_not\":{\"A\":\"..\",\"B\":\"..\",\"C\":\"..\",\"D\":\"..\",\"E\":\"..\"}}"
+    )
+    last_err = None
+    try:
+        raw = gemini3_solve(prompt)
+        data = _extract_json_strict(raw)
+        if isinstance(data, dict) and int(data.get("answer", 0) or 0) > 0:
+            return data
+    except Exception as e:
+        last_err = e
+    if USE_PERPLEXITY_FALLBACK:
+        try:
+            alt = query_ai(prompt)
+            if alt:
+                try:
+                    data = _extract_json_strict(alt)
+                    if isinstance(data, dict) and int(data.get("answer", 0) or 0) > 0:
+                        return data
+                except Exception:
+                    pass
+                inferred = _infer_option_from_text(alt, len(opts))
+                return {
+                    "answer": inferred,
+                    "confidence": 0,
+                    "explanation": (alt[:1800] if isinstance(alt, str) else str(alt)[:1800]),
+                    "why_not": {},
+                }
+        except Exception as e:
+            last_err = e
+    if USE_OFFICIAL_GEMINI_REST_FALLBACK and GEMINI_API_KEY:
+        try:
+            raw2 = call_gemini_text_rest(prompt, timeout_seconds=18, force_json=True)
+            data2 = _extract_json_strict(raw2)
+            if isinstance(data2, dict):
+                return data2
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"MCQ solver failed: {str(last_err)[:120] if last_err else 'all backends unavailable'}")
+
+
+async def on_solver_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.callback_query:
+        return
+    q = update.callback_query
+    await q.answer("Processing…", show_alert=False)
+    data = (q.data or "").strip()
+    m = re.match(r"^solve:([GPD]):([0-9a-f]{6,16})$", data)
+    if not m:
+        return
+    model = m.group(1)
+    token = m.group(2)
+    store = _pending_store(context)
+    req = store.get(token)
+    if not isinstance(req, dict):
+        with contextlib.suppress(Exception):
+            await q.edit_message_text("⚠️ This request has expired. Please send your question again.")
+        return
+    uid = int(req.get("uid") or 0)
+    if q.from_user and q.from_user.id != uid:
+        with contextlib.suppress(Exception):
+            await q.answer("This is not your request.", show_alert=True)
+        return
+    payload = req.get("payload") or {}
+    problem_text = str(payload.get("text") or "").strip()
+    kind = str(req.get("kind") or "text").lower()
+    with contextlib.suppress(Exception):
+        await q.edit_message_text(ui_box_text("Solving", "Please wait… Processing your request.", emoji="⏳"), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    try:
+        if kind == "poll" and payload.get("question"):
+            question = str(payload.get("question", "")).strip()
+            options = payload.get("options", [])
+            if model == "G":
+                result = await _run_blocking(_role_of(uid), gemini_solve_mcq_json, question, options)
+                model_name = "Gemini"
+            elif model == "P":
+                result = await _run_blocking(_role_of(uid), perplexity_solve_mcq_json, question, options)
+                model_name = "Perplexity"
+            else:
+                result = await _run_blocking(_role_of(uid), deepseek_solve_mcq_json, question, options)
+                model_name = "DeepSeek"
+            raw_expl = str(result.get('explanation', '') or "")
+            clean_expl = clean_latex(raw_expl)
+            raw_why_not = result.get("why_not", {}) or {}
+            clean_why_not = {k: clean_latex(v) for k, v in raw_why_not.items()}
+            msg_html = _format_user_poll_solution(
+                question=question,
+                options=options,
+                model_ans=int(result.get("answer", 0) or 0),
+                official_ans=int(payload.get("official_ans", 0) or 0),
+                model_expl=f"[{model_name}]\n{clean_expl}".strip(),
+                official_expl=str(payload.get("official_expl", "")).strip(),
+                why_not=clean_why_not,
+                conf=int(result.get("confidence", 0) or 0),
+            )
+            kb = _verify_kb(token, model, "poll")
+        else:
+            if model == "G":
+                answer = await _run_blocking(_role_of(uid), gemini_solve_text, problem_text)
+            elif model == "P":
+                answer = await _run_blocking(_role_of(uid), perplexity_solve_text, problem_text)
+            else:
+                answer = await _run_blocking(_role_of(uid), deepseek_solve_text, problem_text)
+            if (is_admin(uid) or is_owner(uid)) and (looks_like_programming_request(problem_text) or looks_like_programming_request(answer)):
+                msg_html = f"<pre>{h(answer)}</pre>"
+            else:
+                msg_html = h(answer)
+            kb = _verify_kb(token, model, "text")
+        with contextlib.suppress(Exception):
+            await q.edit_message_text(msg_html, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            if q.message and kind == "poll":
+                _remember_quiz_context(context, q.message.message_id, payload)
+    except Exception as e:
+        db_log("ERROR", "solver_callback_failed", {"user_id": uid, "model": model, "error": str(e)})
+        with contextlib.suppress(Exception):
+            await q.edit_message_text(ui_box_text("Solve Failed", str(e)[:180], emoji="❌"), parse_mode=ParseMode.HTML)
+
+
+async def handle_user_text_unusual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    uid = update.effective_user.id
+    if is_banned(uid):
+        return
+    if not await enforce_required_memberships(update, context):
+        return
+    role = get_role(uid)
+    private = is_private_chat(update)
+    if role == ROLE_USER:
+        if not solver_mode_on(uid):
+            if private:
+                await warn_unauthorized(update, "This bot is currently restricted for staff operations. Please use /ask [message] for support.")
+            return
+        if not private and not is_group_ai_enabled(update.effective_chat.id):
+            return
+    elif role in (ROLE_ADMIN, ROLE_OWNER):
+        if not private or not solver_mode_on(uid):
+            return
+    else:
+        return
+    user_text = (update.message.text or "").strip()
+    if not user_text:
+        return
+    reply_msg = update.message.reply_to_message
+    if reply_msg:
+        ctx = _get_quiz_context(context, reply_msg.message_id)
+        if not ctx and getattr(reply_msg, 'poll', None):
+            poll = reply_msg.poll
+            ctx = {
+                "question": str(poll.question or "").strip(),
+                "options": [str(o.text).strip() for o in (poll.options or []) if str(o.text or '').strip()],
+                "official_ans": _poll_official_answer(poll),
+                "official_expl": str(getattr(poll, 'explanation', '') or '').strip(),
+            }
+        if ctx:
+            qtext = str(ctx.get("question", "") or "").strip()
+            opts = ctx.get("options", []) or []
+            prompt = f"Question:\n{qtext}\n\nOptions:\n" + "\n".join([f"{_safe_letter(i+1)}. {o}" for i, o in enumerate(opts)]) + f"\n\nUser follow-up:\n{user_text}"
+            await send_solver_picker(update, context, prompt)
+            return
+    await send_solver_picker(update, context, user_text)
+
+
+def _copyable_quiz_block(question: str, options: List[str], labels: Optional[List[str]] = None) -> str:
+    parts = [question.strip(), ""]
+    labs = labels or []
+    for i, o in enumerate(options, start=1):
+        label = labs[i-1] if i-1 < len(labs) else f"{_safe_letter(i)})"
+        parts.append(f"{label} {o}")
+    raw = "\n".join(parts).strip()
+    return f"<pre>{h(raw)}</pre>"
+
+
+@require_admin
+async def cmd_postemoji(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if not context.args or not context.args[0].isdigit():
+        await safe_reply(update, usage_box("postemoji", "<DB-ID> [keep]", "Post buffered questions as emoji quiz to a channel"))
+        return
+    cid = int(context.args[0])
+    keep = (len(context.args) > 1 and context.args[1].strip().lower() == "keep")
+    ch = channel_get_by_id_for_user(admin_id, cid)
+    if not ch:
+        await warn(update, "Not Found", "Channel not found or no access.")
+        return
+    items = buffer_list(admin_id, limit=MAX_BUFFERED_QUESTIONS)
+    if not items:
+        await warn(update, "Buffer Empty", "No buffered questions found.")
+        return
+    sent = 0
+    sent_ids = []
+    prefix = str(getattr(ch, "prefix", "") or "").strip()
+    title = prefix if prefix else BOT_BRAND
+    for bid, payload in items:
+        qtext, opts, corr_idx0, explanation = quiz_to_poll_parts(payload)
+        labels = EMOJI_BUTTONS[:len(opts)]
+        block = _copyable_quiz_block(qtext, opts, labels=labels)
+        msg_html = f"<b>{h(title)}</b>\n\n{block}"
+        quiz_id = uuid.uuid4().hex[:10]
+        try:
+            m = await context.bot.send_message(
+                chat_id=ch.channel_chat_id,
+                text=msg_html,
+                parse_mode=ParseMode.HTML,
+                reply_markup=emoji_quiz_keyboard(len(opts), quiz_id),
+                disable_web_page_preview=True,
+            )
+            sent += 1
+            sent_ids.append(bid)
+            emoji_quiz_save(
+                quiz_id,
+                ch.channel_chat_id,
+                m.message_id,
+                {
+                    "question": qtext,
+                    "options": opts,
+                    "correct_answer": corr_idx0 + 1 if corr_idx0 >= 0 else 0,
+                    "explanation": explanation,
+                    "prefix": title,
+                },
+                admin_id,
+            )
+            await asyncio.sleep(0.25)
+        except Exception as e:
+            db_log("ERROR", "postemoji_failed", {"admin_id": admin_id, "channel": ch.channel_chat_id, "error": str(e)})
+    if sent and not keep:
+        buffer_remove_ids(admin_id, sent_ids)
+    await ok_html(update, "Emoji Quiz Posted", f"Sent: <code>{h(sent)}</code>\nChannel: <code>{h(ch.title)}</code>")
+
+
+async def on_emoji_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.callback_query:
+        return
+    q = update.callback_query
+    data = (q.data or "").strip()
+    m = re.match(r"^eq:([0-9a-f]{6,16}):(\d+)$", data)
+    if not m:
+        return
+    quiz_id = m.group(1)
+    selected = int(m.group(2))
+    uid = q.from_user.id if q.from_user else 0
+    if not uid:
+        return
+    ok, _missing = await user_meets_required_memberships(context, uid)
+    if not ok:
+        await q.answer("⚠️ আগে required channel-এ join করো, তারপর Verify দাও।", show_alert=True)
+        return
+    quiz = emoji_quiz_get(quiz_id)
+    if not quiz:
+        await q.answer("Quiz expired or not found.", show_alert=True)
+        return
+    saved_choice = emoji_quiz_user_choice(quiz_id, uid)
+    if saved_choice and int(saved_choice) != int(selected):
+        saved_label = EMOJI_BUTTONS[saved_choice - 1] if 0 < saved_choice <= len(EMOJI_BUTTONS) else str(saved_choice)
+        await q.answer(f"⚠️ তুমি আগে {saved_label} দিয়ে answer দিয়েছো। Result দেখতে একই reaction-এ tap করো।", show_alert=True)
+        return
+    correct = int(quiz.get("correct_answer", 0) or 0)
+    if not saved_choice:
+        emoji_quiz_record_answer(quiz_id, uid, selected, (selected == correct and correct > 0))
+        saved_choice = selected
+    counts = emoji_quiz_counts(quiz_id)
+    opts = quiz.get("options", []) or []
+    stats_text = " | ".join([f"{EMOJI_BUTTONS[i-1]}={counts.get(i, 0)}" for i in range(1, len(opts) + 1)])
+    expl = clean_latex(str(quiz.get("explanation", "") or "").strip())
+    expl = re.sub(r"\s+", " ", expl).strip()
+    if len(expl) > 90:
+        expl = expl[:87] + "..."
+    sel_label = EMOJI_BUTTONS[saved_choice - 1] if 0 < saved_choice <= len(EMOJI_BUTTONS) else str(saved_choice)
+    corr_label = EMOJI_BUTTONS[correct - 1] if 0 < correct <= len(EMOJI_BUTTONS) else str(correct)
+    if saved_choice == correct and correct > 0:
+        msg = f"✅ Correct\nYour reaction: {sel_label}\n{stats_text}"
+    else:
+        msg = f"❌ Wrong\nYour reaction: {sel_label}\n✅ Correct: {corr_label}\n{stats_text}"
+    if expl:
+        msg += f"\n\n{expl}"
+    await q.answer(msg[:190], show_alert=True)
+
+
+_original_handle_image = handle_image
+
+
+# ===========================
+# FINAL STABLE OVERRIDES
+# ===========================
+USE_OFFICIAL_GEMINI_REST_FALLBACK = False
+USE_GEMINI_REST_FOR_GENQUIZ = True
+REQUIRED_DEFAULT_JOIN_URL = "https://t.me/FX_Ur_Target"
+REQUIRED_DEFAULT_CHAT_USERNAME = "@FX_Ur_Target"
+REQUIRED_DEFAULT_CHAT_TITLE = "✨TARGET🎯"
+
+
+def _effective_required_targets() -> List[Dict[str, Any]]:
+    rows = required_chat_list()
+    targets: List[Dict[str, Any]] = []
+    seen = set()
+    for r in rows:
+        try:
+            cid = int(r["chat_id"])
+        except Exception:
+            cid = r["chat_id"]
+        title = str(r["title"] or cid)
+        if title.startswith("@"):
+            url = f"https://t.me/{title.lstrip('@')}"
+        elif "t.me/" in title:
+            url = title if title.startswith("http") else ("https://" + title.lstrip("/"))
+        else:
+            url = REQUIRED_DEFAULT_JOIN_URL
+        targets.append({"chat_id": cid, "title": title, "url": url})
+        seen.add(str(cid))
+        seen.add(title.lower())
+    if REQUIRED_DEFAULT_CHAT_USERNAME.lower() not in seen:
+        targets.insert(0, {
+            "chat_id": REQUIRED_DEFAULT_CHAT_USERNAME,
+            "title": REQUIRED_DEFAULT_CHAT_TITLE,
+            "url": REQUIRED_DEFAULT_JOIN_URL,
+        })
+    return targets
+
+
+def _required_join_kb() -> InlineKeyboardMarkup:
+    rows = []
+    targets = _effective_required_targets()
+    primary = targets[0] if targets else {"url": REQUIRED_DEFAULT_JOIN_URL, "title": REQUIRED_DEFAULT_CHAT_TITLE}
+    rows.append([InlineKeyboardButton("📢 Join Channel", url=str(primary.get("url") or REQUIRED_DEFAULT_JOIN_URL))])
+    if len(targets) > 1:
+        for t in targets[1:8]:
+            rows.append([InlineKeyboardButton(f"Join {str(t.get('title') or 'Chat')}", url=str(t.get("url") or REQUIRED_DEFAULT_JOIN_URL))])
+    rows.append([InlineKeyboardButton("✅ I Joined", callback_data="req:verify")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def user_meets_required_memberships(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> Tuple[bool, List[str]]:
+    targets = _effective_required_targets()
+    if not targets:
+        return True, []
+    missing: List[str] = []
+    for t in targets:
+        cid = t.get("chat_id")
+        title = str(t.get("title") or cid)
+        try:
+            member = await context.bot.get_chat_member(cid, int(user_id))
+            status = str(getattr(member, "status", "")).lower()
+            if status in ("left", "kicked"):
+                missing.append(title)
+        except Exception:
+            missing.append(title)
+    return (len(missing) == 0), missing
+
+
+def _warn_count_or_increment(user_id: int, *, throttle_seconds: int = 45) -> int:
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT warn_count, last_warn_at FROM user_warnings WHERE user_id=?", (int(user_id),))
+    row = cur.fetchone(); conn.close()
+    if row and row["last_warn_at"]:
+        try:
+            last = dt.datetime.fromisoformat(str(row["last_warn_at"]))
+            now = dt.datetime.now(last.tzinfo or dt.timezone.utc)
+            if abs((now - last).total_seconds()) <= throttle_seconds:
+                return int(row["warn_count"] or 0)
+        except Exception:
+            pass
+    return inc_warn_count(user_id)
+
+
+async def _send_join_required_message(update: Update, context: ContextTypes.DEFAULT_TYPE, missing: List[str]) -> None:
+    names = ", ".join(missing[:3]) if missing else REQUIRED_DEFAULT_CHAT_TITLE
+    body_html = (
+        f"You must join <b>{h(names)}</b> before using this bot."
+        f"\n\nTap <b>Join Channel</b>, then press <b>I Joined</b>."
+    )
+    msg = ui_box_html("Join Required", body_html, emoji="⚠️")
+    if update.message:
+        old_mid = None
+        try:
+            old_mid = context.user_data.get("_req_prompt_mid")
+        except Exception:
+            old_mid = None
+        if old_mid:
+            with contextlib.suppress(Exception):
+                await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=int(old_mid))
+        try:
+            sent = await update.message.reply_text(
+                msg,
+                parse_mode=ParseMode.HTML,
+                reply_markup=_required_join_kb(),
+                disable_web_page_preview=True,
+            )
+            try:
+                context.user_data["_req_prompt_mid"] = sent.message_id
+            except Exception:
+                pass
+            return
+        except Exception:
+            pass
+    if update.callback_query and update.callback_query.message:
+        with contextlib.suppress(Exception):
+            await update.callback_query.message.edit_text(
+                msg,
+                parse_mode=ParseMode.HTML,
+                reply_markup=_required_join_kb(),
+                disable_web_page_preview=True,
+            )
+            return
+    if update.effective_user:
+        await safe_send_text(context.bot, update.effective_user.id, msg, reply_markup=_required_join_kb())
+
+
+async def enforce_required_memberships(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    ensure_user(update)
+    uid = update.effective_user.id if update.effective_user else 0
+    if not uid or is_owner(uid) or is_admin(uid):
+        return True
+    ok, missing = await user_meets_required_memberships(context, uid)
+    if ok:
+        reset_warn_count(uid)
+        return True
+    count = _warn_count_or_increment(uid)
+    if count >= 5:
+        set_ban(uid, True)
+        audit_ban(OWNER_ID, uid, "BAN")
+        with contextlib.suppress(Exception):
+            await safe_send_text(context.bot, uid, f"🚫 You are banned from <b>{h(BOT_BRAND)}</b>. Contact: {h(OWNER_CONTACT)}")
+        return False
+    await _send_join_required_message(update, context, missing)
+    return False
+
+
+async def on_required_verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.callback_query:
+        return
+    q = update.callback_query
+    uid = q.from_user.id if q.from_user else 0
+    if not uid:
+        with contextlib.suppress(Exception):
+            await q.answer("User not found.", show_alert=True)
+        return
+    if is_owner(uid) or is_admin(uid):
+        with contextlib.suppress(Exception):
+            await q.answer("Verified.", show_alert=False)
+        return
+    ok, missing = await user_meets_required_memberships(context, uid)
+    if ok:
+        reset_warn_count(uid)
+        with contextlib.suppress(Exception):
+            await q.answer("Verification successful.", show_alert=True)
+        with contextlib.suppress(Exception):
+            if q.message:
+                await q.message.delete()
+        role = get_role(uid)
+        body_html = (
+            f"<b>Your Role:</b> <code>{h(role)}</code>"
+            f"\n\nUse <code>/help</code> for commands or <code>/commands</code> for a quick list."
+        )
+        msg = ui_box_html(f"Welcome to {BOT_BRAND}", body_html, emoji="👋")
+        await safe_send_text(context.bot, uid, msg)
+        return
+    count = _warn_count_or_increment(uid)
+    with contextlib.suppress(Exception):
+        await q.answer("Join the required channel first.", show_alert=True)
+    if count >= 5:
+        set_ban(uid, True)
+        audit_ban(OWNER_ID, uid, "BAN")
+        with contextlib.suppress(Exception):
+            if q.message:
+                await q.message.edit_text(f"🚫 You are banned from {BOT_BRAND}. Contact: {OWNER_CONTACT}")
+        return
+    await _send_join_required_message(update, context, missing)
+
+
+@require_admin
+async def cmd_setprefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not context.args or not str(context.args[0]).isdigit():
+        await safe_reply(update, usage_box("setprefix", "<DB-ID> [text]", "Set or clear the prefix for a channel"))
+        return
+    cid = int(context.args[0])
+    new_prefix = " ".join(context.args[1:]).strip() if len(context.args) > 1 else ""
+    ch = channel_get_by_id_for_user(uid, cid)
+    if not ch:
+        await warn(update, "Not Found", "Channel not found or you don't have access.")
+        return
+    old_prefix = getattr(ch, "prefix", "") or "(empty)"
+    ok2 = channel_set_prefix(cid, new_prefix)
+    if ok2:
+        shown = new_prefix if new_prefix else "(empty)"
+        body = (
+            f"Channel: {h(getattr(ch, 'title', cid))}\n"
+            f"DB-ID: {h(cid)}\n"
+            f"Old Prefix: {h(old_prefix)}\n"
+            f"New Prefix: {h(shown)}"
+        )
+        await ok(update, "Prefix Updated", body)
+    else:
+        await err(update, "Update Failed", "Could not update the prefix.")
+
+
+@require_admin
+async def cmd_setexplink(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not context.args or not str(context.args[0]).isdigit():
+        await safe_reply(update, usage_box("setexplink", "<DB-ID> [link]", "Set or clear the explanation link for a channel"))
+        return
+    cid = int(context.args[0])
+    new_link = " ".join(context.args[1:]).strip() if len(context.args) > 1 else ""
+    ch = channel_get_by_id_for_user(uid, cid)
+    if not ch:
+        await warn(update, "Not Found", "Channel not found or you don't have access.")
+        return
+    old_link = getattr(ch, "expl_link", "") or "(empty)"
+    ok2 = channel_set_expl_link(cid, new_link)
+    if ok2:
+        shown = new_link if new_link else "(empty)"
+        body = (
+            f"Channel: {h(getattr(ch, 'title', cid))}\n"
+            f"DB-ID: {h(cid)}\n"
+            f"Old Link: {h(old_link)}\n"
+            f"New Link: {h(shown)}"
+        )
+        await ok(update, "Link Updated", body)
+    else:
+        await err(update, "Update Failed", "Could not update the link.")
+
+
+@require_owner
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT user_id, role, first_name, username, is_banned, created_at, last_seen_at FROM users ORDER BY created_at ASC")
+    rows = cur.fetchall(); conn.close()
+    if not rows:
+        await warn(update, "No Users", "No users found.")
+        return
+    data = []
+    for i, r in enumerate(rows, start=1):
+        item = dict(r)
+        item["serial"] = i
+        data.append(item)
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        path = f.name
+    try:
+        with open(path, "rb") as rf:
+            await context.bot.send_document(
+                chat_id=update.effective_user.id,
+                document=rf,
+                filename="probaho_users.json",
+                caption=f"All started users • Total: {len(data)}",
+            )
+    finally:
+        with contextlib.suppress(Exception):
+            os.unlink(path)
+
+
+@require_admin
+async def cmd_usersd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not str(context.args[0]).lstrip("-").isdigit():
+        await safe_reply(update, usage_box("usersd", "<user_id>", "Show a clickable profile link for a user ID"))
+        return
+    target = int(context.args[0])
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT first_name, username, role, is_banned, created_at, last_seen_at FROM users WHERE user_id=?", (target,))
+    row = cur.fetchone(); conn.close()
+    if row:
+        name = row["first_name"] or str(target)
+        uname = ("@" + row["username"]) if row["username"] else "(none)"
+        body = (
+            f"Profile: {mention_user(target, name)}\n"
+            f"User ID: <code>{h(target)}</code>\n"
+            f"Username: {h(uname)}\n"
+            f"Role: <code>{h(row['role'] or 'USER')}</code>\n"
+            f"Banned: <code>{'Yes' if int(row['is_banned'] or 0) else 'No'}</code>\n"
+            f"Created: <code>{h(row['created_at'] or '')}</code>\n"
+            f"Last Seen: <code>{h(row['last_seen_at'] or '')}</code>"
+        )
+    else:
+        body = f"Profile: {mention_user(target, str(target))}\nUser ID: <code>{h(target)}</code>"
+    await ok_html(update, "User Profile Link", body, emoji="🔎")
+
+
+def _all_commands_for(uid: int) -> List[Tuple[str, List[Tuple[str, str]]]]:
+    role = get_role(uid)
+    sections: List[Tuple[str, List[Tuple[str, str]]]] = []
+    user_cmds = [
+        ("/start", "Start / membership check"),
+        ("/help", "Detailed command guide"),
+        ("/commands", "All commands list"),
+        ("/ask", "Contact support"),
+        ("/solve_on", "Enable private AI solving"),
+        ("/solve_off", "Disable private AI solving"),
+    ]
+    if can_use_vision(uid):
+        user_cmds += [
+            ("/scanhelp", "Image-to-quiz guide"),
+            ("/vision_on", "Enable image extraction"),
+            ("/vision_off", "Disable image extraction"),
+        ]
+    sections.append(("👤 User Commands", user_cmds))
+    if role in (ROLE_ADMIN, ROLE_OWNER):
+        staff_cmds = [
+            ("/filter", "Add parser filter text"),
+            ("/done", "Export CSV + JSON, then clear buffer"),
+            ("/clear", "Clear buffer"),
+            ("/addchannel", "Add target channel"),
+            ("/listchannels", "List available channels"),
+            ("/removechannel", "Remove a channel"),
+            ("/setprefix", "Set or clear channel prefix"),
+            ("/setexplink", "Set or clear explanation link"),
+            ("/post", "Post normal quizzes"),
+            ("/postemoji", "Post emoji quizzes"),
+            ("/reply", "Reply to support ticket"),
+            ("/close", "Close support ticket"),
+            ("/ban", "Ban a user"),
+            ("/unban", "Unban a user"),
+            ("/banned", "View banned users"),
+            ("/broadcast", "Broadcast message to users"),
+            ("/private_send", "Send private message"),
+            ("/send_private", "Alias of /private_send"),
+            ("/adminpanel", "Posting stats"),
+            ("/himusai_on", "Enable inbox AI-only mode"),
+            ("/himusai_off", "Disable inbox AI-only mode"),
+            ("/probaho_on", "Enable user AI in this group"),
+            ("/probaho_off", "Disable user AI in this group"),
+            ("/explain_on", "Enable explanation in quiz + export"),
+            ("/explain_off", "Disable explanation in quiz + export"),
+            ("/quizprefix", "Set generated quiz prefix"),
+            ("/quizlink", "Set generated quiz link"),
+            ("/usersd", "Open a user profile by ID"),
+        ]
+        sections.append(("🛠 Staff Commands", staff_cmds))
+    if role == ROLE_OWNER:
+        owner_cmds = [
+            ("/addadmin", "Add admin"),
+            ("/removeadmin", "Remove admin"),
+            ("/grantall", "Grant all-channels access"),
+            ("/revokeall", "Revoke all-channels access"),
+            ("/grantvision", "Grant image extraction"),
+            ("/revokevision", "Revoke image extraction"),
+            ("/addrequired", "Add required channel/group"),
+            ("/delrequired", "Remove required channel/group"),
+            ("/listrequired", "List required memberships"),
+            ("/ownerstats", "Owner dashboard"),
+            ("/users", "Export started users JSON"),
+        ]
+        sections.append(("👑 Owner Commands", owner_cmds))
+    return sections
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    uid = update.effective_user.id if update.effective_user else 0
+    if not uid or is_banned(uid):
+        return
+    role = get_role(uid)
+    if role not in (ROLE_ADMIN, ROLE_OWNER):
+        return
+    if is_private_chat(update) and solver_mode_on(uid):
+        return
+    text = update.message.text or ""
+    if not text.strip():
+        return
+    if buffer_count(uid) >= MAX_BUFFERED_QUESTIONS:
+        await warn(update, "Buffer Limit Reached", f"You have {MAX_BUFFERED_QUESTIONS} questions buffered.\n\nUse /done to export or /clear to reset.")
+        return
+    blocks = split_blocks(text)
+    added = 0
+    for b in blocks:
+        if buffer_count(uid) >= MAX_BUFFERED_QUESTIONS:
+            break
+        try:
+            payload = parse_text_block(b, uid)
+            if payload:
+                buffer_add(uid, payload)
+                added += 1
+        except Exception as e:
+            db_log("ERROR", "parse_text_failed", {"admin_id": uid, "error": str(e)})
+    if added:
+        await ok_html(update, "Added to Buffer", f"<code>{h(added)}</code> question(s) added.\n\nTotal buffered: <code>{h(buffer_count(uid))}</code>", footer_html="Use <code>/done</code> to export")
+    else:
+        await warn(update, "No Questions Found", "No valid quiz blocks detected. Check formatting.")
+
+
+async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    uid = update.effective_user.id if update.effective_user else 0
+    if not uid or is_banned(uid):
+        return
+    role = get_role(uid)
+    if role not in (ROLE_ADMIN, ROLE_OWNER):
+        return
+    if is_private_chat(update) and solver_mode_on(uid):
+        return
+    poll = update.message.poll
+    question = clean_common(poll.question or "", uid)
+    options = [o.text for o in poll.options]
+    opts = options + [""] * (5 - len(options))
+    explanation = ""
+    if hasattr(poll, "explanation") and poll.explanation:
+        explanation = clean_explanation(poll.explanation, uid)
+    correct_answer_id = 0
+    if poll.type == "quiz" and poll.correct_option_id is not None:
+        correct_answer_id = int(poll.correct_option_id) + 1
+    payload = {
+        "questions": question,
+        "option1": (opts[0] or "").strip(),
+        "option2": (opts[1] or "").strip(),
+        "option3": (opts[2] or "").strip(),
+        "option4": (opts[3] or "").strip(),
+        "option5": (opts[4] or "").strip(),
+        "answer": correct_answer_id,
+        "explanation": explanation,
+        "type": 1,
+        "section": 1,
+    }
+    if buffer_count(uid) >= MAX_BUFFERED_QUESTIONS:
+        await warn_html(update, "Buffer Limit Reached", f"You have <code>{h(MAX_BUFFERED_QUESTIONS)}</code> questions buffered.\n\nUse <code>/done</code> to export or <code>/clear</code> to reset.")
+        return
+    buffer_add(uid, payload)
+    note = ""
+    if correct_answer_id == 0 and poll.type == "quiz":
+        note = "\n\n⚠️ Telegram may hide the correct answer in forwarded quizzes. CSV will store <code>answer=0</code>."
+    body = f"Total buffered: <code>{buffer_count(uid)}</code>{note}"
+    await ok_html(update, "Poll Saved", body)
+
+
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if uid and get_role(uid) in (ROLE_ADMIN, ROLE_OWNER) and is_private_chat(update) and solver_mode_on(uid):
+        return
+    # fall through to existing image extraction logic
+    return await globals()["_original_handle_image"](update, context)
+
+
+def gemini_solve_text(problem_text: str) -> str:
+    prompt = (
+        STRICT_SYSTEM_PROMPT
+        + "\n\nUser Message:\n"
+        + (problem_text or "").strip()
+    )
+    try:
+        out = gemini3_solve(prompt)
+        if out and str(out).strip():
+            return str(out).strip()
+    except Exception:
+        pass
+    if USE_PERPLEXITY_FALLBACK:
+        try:
+            alt = query_ai(prompt)
+            if alt:
+                return alt.strip()
+        except Exception:
+            pass
+    if USE_OFFICIAL_GEMINI_REST_FALLBACK and GEMINI_API_KEY:
+        try:
+            return call_gemini_text_rest(prompt, timeout_seconds=18).strip()
+        except Exception:
+            pass
+    raise RuntimeError("AI backend is temporarily unavailable. Please try again.")
+
+
+def _infer_option_from_text(text: str, n: int) -> int:
+    s = (text or "").upper()
+    patterns = [
+        r"FINAL ANSWER\s*[:\-]\s*([A-E])",
+        r"CORRECT ANSWER\s*[:\-]\s*([A-E])",
+        r"ANSWER\s*[:\-]\s*([A-E])",
+        r"OPTION\s*([A-E])",
+        r"\(([A-E])\)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, s)
+        if m:
+            idx = ord(m.group(1)) - 64
+            if 1 <= idx <= n:
+                return idx
+    return 0
+
+
+def gemini_solve_mcq_json(question: str, options: List[str]) -> Dict[str, Any]:
+    q = (question or "").strip()
+    opts = [(o or "").strip() for o in (options or []) if (o or "").strip()][:5]
+    if len(opts) < 2:
+        raise ValueError("Not enough options to solve.")
+    opt_lines = "\n".join([f"{_safe_letter(i+1)}. {opts[i]}" for i in range(len(opts))])
+    prompt = (
+        "Return STRICT JSON only. No markdown. No extra text.\n\n"
+        "Task: Solve the following MCQ and pick the correct option.\n"
+        "Rules:\n"
+        "- answer must be 1-5 (A=1,B=2,C=3,D=4,E=5). If unsure, pick the best option.\n"
+        "- explanation: clear exam-style explanation.\n"
+        "- why_not: short reason for wrong options.\n"
+        "- confidence: 0-100 integer.\n\n"
+        f"Question:\n{q}\n\nOptions:\n{opt_lines}\n\n"
+        "JSON format:\n"
+        "{\"answer\":1,\"confidence\":0,\"explanation\":\"...\",\"why_not\":{\"A\":\"..\",\"B\":\"..\",\"C\":\"..\",\"D\":\"..\",\"E\":\"..\"}}"
+    )
+    try:
+        raw = gemini3_solve(prompt)
+        data = _extract_json_strict(raw)
+        if isinstance(data, dict) and int(data.get("answer", 0) or 0) > 0:
+            return data
+    except Exception:
+        pass
+    if USE_PERPLEXITY_FALLBACK:
+        try:
+            alt = query_ai(prompt)
+            if alt:
+                try:
+                    data = _extract_json_strict(alt)
+                    if isinstance(data, dict) and int(data.get("answer", 0) or 0) > 0:
+                        return data
+                except Exception:
+                    pass
+                inferred = _infer_option_from_text(alt, len(opts))
+                return {
+                    "answer": inferred,
+                    "confidence": 0,
+                    "explanation": (alt[:1800] if isinstance(alt, str) else str(alt)[:1800]),
+                    "why_not": {},
+                }
+        except Exception:
+            pass
+    if USE_OFFICIAL_GEMINI_REST_FALLBACK and GEMINI_API_KEY:
+        try:
+            raw2 = call_gemini_text_rest(prompt, timeout_seconds=18, force_json=True)
+            data2 = _extract_json_strict(raw2)
+            if isinstance(data2, dict):
+                return data2
+        except Exception:
+            pass
+    raise RuntimeError("AI backend is temporarily unavailable. Please try again.")
+
+
+def _solve_text_with_preference(model: str, problem_text: str) -> Tuple[str, str]:
+    model = (model or "G").upper()
+    if model == "P":
+        try:
+            return perplexity_solve_text(problem_text), "Perplexity"
+        except Exception:
+            return gemini_solve_text(problem_text), "Gemini"
+    if model == "D":
+        try:
+            return deepseek_solve_text(problem_text), "DeepSeek"
+        except Exception:
+            return gemini_solve_text(problem_text), "Gemini"
+    return gemini_solve_text(problem_text), "Gemini"
+
+
+def _solve_mcq_with_preference(model: str, question: str, options: List[str]) -> Tuple[Dict[str, Any], str]:
+    model = (model or "G").upper()
+    if model == "P":
+        try:
+            return perplexity_solve_mcq_json(question, options), "Perplexity"
+        except Exception:
+            return gemini_solve_mcq_json(question, options), "Gemini"
+    if model == "D":
+        try:
+            return deepseek_solve_mcq_json(question, options), "DeepSeek"
+        except Exception:
+            return gemini_solve_mcq_json(question, options), "Gemini"
+    return gemini_solve_mcq_json(question, options), "Gemini"
+
+
+async def handle_user_poll_solver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    if not update.effective_user or not update.message or not update.message.poll:
+        return
+    uid = update.effective_user.id
+    if is_banned(uid):
+        return
+    role = get_role(uid)
+    private = is_private_chat(update)
+    if role == ROLE_USER:
+        if private:
+            if not solver_mode_on(uid):
+                return
+        else:
+            if not is_group_ai_enabled(update.effective_chat.id):
+                return
+        if not await enforce_required_memberships(update, context):
+            return
+    elif role in (ROLE_ADMIN, ROLE_OWNER):
+        if not private or not solver_mode_on(uid):
+            return
+    else:
+        return
+
+    poll = update.message.poll
+    qtext = (poll.question or "").strip()
+    options = [str(o.text).strip() for o in (poll.options or []) if str(o.text or '').strip()]
+    official_expl = str(getattr(poll, "explanation", "") or "").strip()
+    official_ans = _poll_official_answer(poll)
+
+    spinner_msg = None
+    spinner_task = None
+    try:
+        spinner_msg = await update.message.reply_text("🔎 Searching")
+        spinner_task = asyncio.create_task(_spinner_task(context.bot, spinner_msg.chat_id, spinner_msg.message_id))
+        data = await _run_blocking(_role_of(uid), gemini_solve_mcq_json, qtext, options)
+        model_ans = int(data.get("answer", 0) or 0)
+        conf = int(data.get("confidence", 0) or 0)
+        raw_expl = str(data.get("explanation", "") or "").strip()
+        model_expl = clean_latex(raw_expl)
+        raw_why_not = data.get("why_not", {}) or {}
+        why_not = {k: clean_latex(v) for k, v in raw_why_not.items()}
+        if spinner_task:
+            spinner_task.cancel()
+        if spinner_msg:
+            with contextlib.suppress(Exception):
+                await context.bot.delete_message(chat_id=spinner_msg.chat_id, message_id=spinner_msg.message_id)
+        msg_html = _format_user_poll_solution(
+            question=qtext,
+            options=options,
+            model_ans=model_ans,
+            official_ans=official_ans,
+            model_expl=f"[Gemini 3 Flash]\n{model_expl}".strip(),
+            official_expl=official_expl,
+            why_not=why_not if isinstance(why_not, dict) else {},
+            conf=conf,
+        )
+        poll_payload = {
+            "question": qtext,
+            "options": options,
+            "official_ans": official_ans,
+            "official_expl": official_expl,
+        }
+        await send_poll_verify_buttons(update, context, poll_payload, msg_html)
+    except Exception as e:
+        if spinner_task:
+            spinner_task.cancel()
+        if spinner_msg:
+            with contextlib.suppress(Exception):
+                await context.bot.delete_message(chat_id=spinner_msg.chat_id, message_id=spinner_msg.message_id)
+        db_log("ERROR", "poll_solver_failed", {"user_id": uid, "error": str(e)})
+        await err(update, "Solve Failed", "AI backend is temporarily unavailable. Please try again.")
+
+
+async def handle_user_text_unusual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    uid = update.effective_user.id
+    if is_banned(uid):
+        return
+    role = get_role(uid)
+    private = is_private_chat(update)
+    if role == ROLE_USER:
+        if private:
+            if not solver_mode_on(uid):
+                await warn_unauthorized(update, "This bot is currently restricted for staff operations. Please use /ask [message] for support.")
+                return
+            if not await enforce_required_memberships(update, context):
+                return
+        else:
+            if not is_group_ai_enabled(update.effective_chat.id):
+                return
+            if not await enforce_required_memberships(update, context):
+                return
+    elif role in (ROLE_ADMIN, ROLE_OWNER):
+        if not private or not solver_mode_on(uid):
+            return
+    else:
+        return
+    user_text = (update.message.text or "").strip()
+    if not user_text:
+        return
+    reply_msg = update.message.reply_to_message
+    if reply_msg:
+        ctx = _get_quiz_context(context, reply_msg.message_id)
+        if not ctx and getattr(reply_msg, 'poll', None):
+            poll = reply_msg.poll
+            ctx = {
+                "question": str(poll.question or "").strip(),
+                "options": [str(o.text).strip() for o in (poll.options or []) if str(o.text or '').strip()],
+                "official_ans": _poll_official_answer(poll),
+                "official_expl": str(getattr(poll, 'explanation', '') or '').strip(),
+            }
+        if ctx:
+            qtext = str(ctx.get("question", "") or "").strip()
+            opts = ctx.get("options", []) or []
+            prompt = f"Question:\n{qtext}\n\nOptions:\n" + "\n".join([f"{_safe_letter(i+1)}. {o}" for i, o in enumerate(opts)]) + f"\n\nUser follow-up:\n{user_text}"
+            await send_solver_picker(update, context, prompt)
+            return
+    await send_solver_picker(update, context, user_text)
+
+
+async def cmd_probaho_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    uid = update.effective_user.id if update.effective_user else 0
+    if not chat or chat.type not in ("group", "supergroup"):
+        await warn(update, "Group Only", "Use this command inside a group/supergroup.")
+        return
+    if not await _is_group_admin(context, chat.id, uid):
+        await warn(update, "Unauthorized", "Only a group admin can use this command.")
+        return
+    set_group_ai_enabled(chat.id, True)
+    await ok(update, "Group AI Enabled", f"Users can now get AI responses in this group: {chat.id}")
+
+
+async def cmd_probaho_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    uid = update.effective_user.id if update.effective_user else 0
+    if not chat or chat.type not in ("group", "supergroup"):
+        await warn(update, "Group Only", "Use this command inside a group/supergroup.")
+        return
+    if not await _is_group_admin(context, chat.id, uid):
+        await warn(update, "Unauthorized", "Only a group admin can use this command.")
+        return
+    set_group_ai_enabled(chat.id, False)
+    await ok(update, "Group AI Disabled", f"Users will no longer get AI responses in this group: {chat.id}")
+
+
+def _emoji_quiz_text(question: str, options: List[str], title: str) -> str:
+    lines = [str(title or BOT_BRAND).strip(), "", str(question or "").strip(), ""]
+    labels = EMOJI_BUTTONS[:len(options)]
+    for i, opt in enumerate(options):
+        label = labels[i] if i < len(labels) else f"{_safe_letter(i+1)})"
+        lines.append(f"{label} {opt}")
+    return "\n".join([x for x in lines if x is not None]).strip()
+
+
+@require_admin
+async def cmd_postemoji(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if not context.args or not context.args[0].isdigit():
+        await safe_reply(update, usage_box("postemoji", "<DB-ID> [keep]", "Post buffered questions as emoji quiz to a channel"))
+        return
+    cid = int(context.args[0])
+    keep = (len(context.args) > 1 and context.args[1].strip().lower() == "keep")
+    ch = channel_get_by_id_for_user(admin_id, cid)
+    if not ch:
+        await warn(update, "Not Found", "Channel not found or no access.")
+        return
+    items = buffer_list(admin_id, limit=MAX_BUFFERED_QUESTIONS)
+    if not items:
+        await warn(update, "Buffer Empty", "No buffered questions found.")
+        return
+    prefix = str(getattr(ch, "prefix", "") or "").strip()
+    title = prefix if prefix else BOT_BRAND
+    sent = 0
+    sent_ids = []
+    for bid, payload in items:
+        qtext, opts, corr_idx0, explanation = quiz_to_poll_parts(payload)
+        if not opts:
+            continue
+        msg_text = _emoji_quiz_text(qtext, opts, title)
+        quiz_id = uuid.uuid4().hex[:10]
+        try:
+            m = await context.bot.send_message(
+                chat_id=ch.channel_chat_id,
+                text=msg_text,
+                reply_markup=emoji_quiz_keyboard(len(opts), quiz_id),
+                disable_web_page_preview=True,
+            )
+            sent += 1
+            sent_ids.append(bid)
+            emoji_quiz_save(
+                quiz_id,
+                ch.channel_chat_id,
+                m.message_id,
+                {
+                    "question": qtext,
+                    "options": opts,
+                    "correct_answer": corr_idx0 + 1 if corr_idx0 >= 0 else 0,
+                    "explanation": explanation,
+                    "prefix": title,
+                },
+                admin_id,
+            )
+            await asyncio.sleep(0.25)
+        except Exception as e:
+            db_log("ERROR", "postemoji_failed", {"admin_id": admin_id, "channel": getattr(ch, 'channel_chat_id', 0), "error": str(e)})
+    if sent and not keep:
+        buffer_remove_ids(admin_id, sent_ids)
+    await ok_html(update, "Emoji Quiz Posted", f"Sent: <code>{h(sent)}</code>\nChannel: <code>{h(getattr(ch, 'title', cid))}</code>")
+
+
+async def on_emoji_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.callback_query:
+        return
+    q = update.callback_query
+    data = (q.data or "").strip()
+    m = re.match(r"^eq:([0-9a-f]{6,16}):(\d+)$", data)
+    if not m:
+        return
+    quiz_id = m.group(1)
+    selected = int(m.group(2))
+    uid = q.from_user.id if q.from_user else 0
+    if not uid:
+        return
+    ok_member, _missing = await user_meets_required_memberships(context, uid)
+    if not ok_member:
+        await q.answer("⚠️ Join the required channel first, then press I Joined.", show_alert=True)
+        return
+    quiz = emoji_quiz_get(quiz_id)
+    if not quiz:
+        await q.answer("Quiz expired or not found.", show_alert=True)
+        return
+    saved_choice = emoji_quiz_user_choice(quiz_id, uid)
+    correct = int(quiz.get("correct_answer", 0) or 0)
+    opts = quiz.get("options", []) or []
+    expl = clean_latex(str(quiz.get("explanation", "") or "").strip())
+    expl = re.sub(r"\s+", " ", expl).strip()
+    if len(expl) > 150:
+        expl = expl[:147] + "..."
+    corr_label = EMOJI_BUTTONS[correct - 1] if 0 < correct <= len(EMOJI_BUTTONS) else str(correct)
+
+    if saved_choice and int(saved_choice) != int(selected):
+        saved_label = EMOJI_BUTTONS[saved_choice - 1] if 0 < saved_choice <= len(EMOJI_BUTTONS) else str(saved_choice)
+        await q.answer(f"⚠️ You already answered with {saved_label}. Tap the same reaction to view your result.", show_alert=True)
+        return
+
+    if not saved_choice:
+        emoji_quiz_record_answer(quiz_id, uid, selected, (selected == correct and correct > 0))
+        sel_label = EMOJI_BUTTONS[selected - 1] if 0 < selected <= len(EMOJI_BUTTONS) else str(selected)
+        if selected == correct and correct > 0:
+            first_msg = f"🎉🎊 Congratulations!\n✅ Correct: {corr_label}\nYour reaction: {sel_label}\n\nTap the same reaction again for explanation & stats."
+        else:
+            first_msg = f"❌ Wrong answer\n✅ Correct: {corr_label}\nYour reaction: {sel_label}\n\nTap the same reaction again for explanation & stats."
+        await q.answer(first_msg[:190], show_alert=True)
+        return
+
+    counts = emoji_quiz_counts(quiz_id)
+    sel_label = EMOJI_BUTTONS[saved_choice - 1] if 0 < saved_choice <= len(EMOJI_BUTTONS) else str(saved_choice)
+    stats_text = " | ".join([f"{EMOJI_BUTTONS[i-1]}={counts.get(i, 0)}" for i in range(1, len(opts) + 1)])
+    if saved_choice == correct and correct > 0:
+        msg = f"🎉🎊 Correct\nYour reaction: {sel_label}\n✅ Correct: {corr_label}"
+    else:
+        msg = f"❌ Wrong\nYour reaction: {sel_label}\n✅ Correct: {corr_label}"
+    if stats_text:
+        msg += f"\n{stats_text}"
+    if expl:
+        msg += f"\n\n{expl}"
+    await q.answer(msg[:190], show_alert=True)
+
+
+async def on_solver_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.callback_query:
+        return
+    q = update.callback_query
+    await q.answer("Processing…", show_alert=False)
+    data = (q.data or "").strip()
+    m = re.match(r"^solve:([GPD]):([0-9a-f]{6,16})$", data)
+    if not m:
+        return
+    model = m.group(1)
+    token = m.group(2)
+    store = _pending_store(context)
+    req = store.get(token)
+    if not isinstance(req, dict):
+        with contextlib.suppress(Exception):
+            await q.edit_message_text("⚠️ This request has expired. Please send your question again.")
+        return
+    uid = int(req.get("uid") or 0)
+    if q.from_user and q.from_user.id != uid:
+        with contextlib.suppress(Exception):
+            await q.answer("This is not your request.", show_alert=True)
+        return
+    payload = req.get("payload") or {}
+    problem_text = str(payload.get("text") or "").strip()
+    kind = str(req.get("kind") or "text").lower()
+    with contextlib.suppress(Exception):
+        await q.edit_message_text(ui_box_text("Solving", "Please wait… Processing your request.", emoji="⏳"), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    try:
+        if kind == "poll" and payload.get("question"):
+            question = str(payload.get("question", "")).strip()
+            options = payload.get("options", [])
+            result, model_name = await _run_blocking(_role_of(uid), _solve_mcq_with_preference, model, question, options)
+            raw_expl = str(result.get('explanation', '') or "")
+            clean_expl = clean_latex(raw_expl)
+            raw_why_not = result.get("why_not", {}) or {}
+            clean_why_not = {k: clean_latex(v) for k, v in raw_why_not.items()}
+            msg_html = _format_user_poll_solution(
+                question=question,
+                options=options,
+                model_ans=int(result.get("answer", 0) or 0),
+                official_ans=int(payload.get("official_ans", 0) or 0),
+                model_expl=f"[{model_name}]\n{clean_expl}".strip(),
+                official_expl=str(payload.get("official_expl", "")).strip(),
+                why_not=clean_why_not,
+                conf=int(result.get("confidence", 0) or 0),
+            )
+            kb = _verify_kb(token, model, "poll")
+        else:
+            answer, _used = await _run_blocking(_role_of(uid), _solve_text_with_preference, model, problem_text)
+            if (is_admin(uid) or is_owner(uid)) and (looks_like_programming_request(problem_text) or looks_like_programming_request(answer)):
+                msg_html = f"<pre>{h(answer)}</pre>"
+            else:
+                msg_html = h(answer)
+            kb = _verify_kb(token, model, "text")
+        with contextlib.suppress(Exception):
+            await q.edit_message_text(msg_html, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            if q.message and kind == "poll":
+                _remember_quiz_context(context, q.message.message_id, payload)
+    except Exception as e:
+        db_log("ERROR", "solver_callback_failed", {"user_id": uid, "model": model, "error": str(e)})
+        with contextlib.suppress(Exception):
+            await q.edit_message_text(ui_box_text("Solve Failed", "AI backend is temporarily unavailable. Please try again.", emoji="❌"), parse_mode=ParseMode.HTML)
+
+
+
+
+# ===========================
+# FINAL UX PATCHES (2026-03-11)
+# ===========================
+
+def _profile_link_keyboard(user_id: int, username: Optional[str] = None) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("👤 Open Profile", url=f"tg://user?id={int(user_id)}")]]
+    un = str(username or "").lstrip("@").strip()
+    if un:
+        rows.append([InlineKeyboardButton(f"🌐 @{un}", url=f"https://t.me/{un}")])
+    return InlineKeyboardMarkup(rows)
+
+
+@require_admin
+async def cmd_usersd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not str(context.args[0]).lstrip("-").isdigit():
+        await safe_reply(update, usage_box("usersd", "<user_id>", "Show a clickable profile button for a user ID"))
+        return
+    target = int(context.args[0])
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT first_name, username, role, is_banned, created_at, last_seen_at FROM users WHERE user_id=?", (target,))
+    row = cur.fetchone(); conn.close()
+    if row:
+        name = row["first_name"] or str(target)
+        username = row["username"] or ""
+        uname = ("@" + username) if username else "(none)"
+        body = (
+            f"Profile: {mention_user(target, name)}\n"
+            f"User ID: <code>{h(target)}</code>\n"
+            f"Username: {h(uname)}\n"
+            f"Role: <code>{h(row['role'] or 'USER')}</code>\n"
+            f"Banned: <code>{'Yes' if int(row['is_banned'] or 0) else 'No'}</code>\n"
+            f"Created: <code>{h(row['created_at'] or '')}</code>\n"
+            f"Last Seen: <code>{h(row['last_seen_at'] or '')}</code>"
+        )
+        kb = _profile_link_keyboard(target, username)
+    else:
+        body = (
+            f"Profile: {mention_user(target, str(target))}\n"
+            f"User ID: <code>{h(target)}</code>\n"
+            f"Stored info: <code>Not found in local users table</code>"
+        )
+        kb = _profile_link_keyboard(target, None)
+    await update.message.reply_text(
+        ui_box_html("User Profile Link", body, emoji="🔎"),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+        disable_web_page_preview=True,
+    )
+
+
+def _format_user_poll_solution(question: str, options: List[str], model_ans: int, official_ans: int, model_expl: str, official_expl: str, why_not: Dict[str, str], conf: int) -> str:
+    opts = [(o or "").strip() for o in (options or []) if (o or "").strip()][:5]
+    copy_block = _copyable_quiz_block(question or "", opts)
+    lines = ["<b>📊 Quiz Solution</b>", "", "<b>Question + Options (copyable):</b>", copy_block]
+    if 1 <= int(model_ans or 0) <= len(opts):
+        lines.append(f"\n<b>✅ AI Response:</b> <b>{_safe_letter(model_ans)}</b>) {h(opts[model_ans-1])}")
+    if official_ans > 0 and official_ans <= len(opts):
+        tag = "✅ Match" if official_ans == model_ans else "❌ Mismatch"
+        lines.append(f"<b>📌 Given Answer:</b> <b>{_safe_letter(official_ans)}</b>) {h(opts[official_ans-1])} <i>({tag})</i>")
+    if model_expl:
+        lines.append("\n<b>Explanation (Solved):</b>")
+        lines.append(h(model_expl))
+    if official_expl:
+        lines.append("\n<b>Explanation (From Quiz):</b>")
+        lines.append(h(official_expl))
+    if why_not:
+        wn = []
+        for k in ["A", "B", "C", "D", "E"]:
+            v = (why_not or {}).get(k)
+            if v:
+                wn.append(f"• <b>{h(k)}</b>: {h(v)}")
+        if wn:
+            lines.append("\n<b>Why other options are wrong:</b>\n" + "\n".join(wn))
+    return "\n".join(lines).strip()
+
+
+async def on_emoji_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.callback_query:
+        return
+    q = update.callback_query
+    data = (q.data or "").strip()
+    m = re.match(r"^eq:([0-9a-f]{6,16}):(\d+)$", data)
+    if not m:
+        return
+    quiz_id = m.group(1)
+    selected = int(m.group(2))
+    uid = q.from_user.id if q.from_user else 0
+    if not uid:
+        return
+
+    ok_member, _missing = await user_meets_required_memberships(context, uid)
+    if not ok_member:
+        await q.answer("⚠️ Join the required channel first, then press I Joined.", show_alert=True)
+        return
+
+    quiz = emoji_quiz_get(quiz_id)
+    if not quiz:
+        await q.answer("Quiz expired or not found.", show_alert=True)
+        return
+
+    saved_choice = emoji_quiz_user_choice(quiz_id, uid)
+    correct = int(quiz.get("correct_answer", 0) or 0)
+    opts = quiz.get("options", []) or []
+    expl = clean_latex(str(quiz.get("explanation", "") or "").strip())
+    expl = re.sub(r"\s+", " ", expl).strip()
+    if len(expl) > 150:
+        expl = expl[:147] + "..."
+
+    corr_label = EMOJI_BUTTONS[correct - 1] if 0 < correct <= len(EMOJI_BUTTONS) else str(correct)
+
+    if saved_choice and int(saved_choice) != int(selected):
+        saved_label = EMOJI_BUTTONS[saved_choice - 1] if 0 < saved_choice <= len(EMOJI_BUTTONS) else str(saved_choice)
+        await q.answer(f"⚠️ You already answered with {saved_label}. Tap the same reaction to view your result.", show_alert=True)
+        return
+
+    if not saved_choice:
+        emoji_quiz_record_answer(quiz_id, uid, selected, (selected == correct and correct > 0))
+        sel_label = EMOJI_BUTTONS[selected - 1] if 0 < selected <= len(EMOJI_BUTTONS) else str(selected)
+        if selected == correct and correct > 0:
+            # Bot API callback answers only support text/alert/url/cache; no native quiz-confetti trigger.
+            toast = "🎉🎊 Congratulations! Tap the same reaction again for explanation & stats."
+            await q.answer(toast[:190], show_alert=False)
+        else:
+            first_msg = f"❌ Wrong answer\n✅ Correct: {corr_label}\nYour reaction: {sel_label}\n\nTap the same reaction again for explanation & stats."
+            await q.answer(first_msg[:190], show_alert=True)
+        return
+
+    counts = emoji_quiz_counts(quiz_id)
+    sel_label = EMOJI_BUTTONS[saved_choice - 1] if 0 < saved_choice <= len(EMOJI_BUTTONS) else str(saved_choice)
+    stats_text = " | ".join([f"{EMOJI_BUTTONS[i-1]}={counts.get(i, 0)}" for i in range(1, len(opts) + 1)])
+    if saved_choice == correct and correct > 0:
+        msg = f"🎉🎊 Congratulations!\nYour reaction: {sel_label}"
+    else:
+        msg = f"❌ Wrong\nYour reaction: {sel_label}\n✅ Correct: {corr_label}"
+    if stats_text:
+        msg += f"\n{stats_text}"
+    if expl:
+        msg += f"\n\n{expl}"
+    await q.answer(msg[:190], show_alert=True)
+
+# ===========================
+# FINAL PATCHES (2026-03-13)
+# ===========================
+
+def _strip_leading_quiz_noise(q: str) -> str:
+    s = str(q or '').strip()
+    # Drop repeated source tags like [White Apron 🩺] at the beginning.
+    while True:
+        new_s = re.sub(r'^\s*\[[^\]]{1,80}\]\s*', '', s)
+        if new_s == s:
+            break
+        s = new_s.strip()
+    # Drop serials such as "124.", "১২৪।", "238)", repeated if needed.
+    s = re.sub(r'^\s*(?:(?:\d+|[০-৯]+)\s*[\.)।:\-]+\s*)+', '', s).strip()
+    return s
+
+
+def _shuffle_quiz_payload(question: str, options: List[str], correct_option_id0: int) -> Tuple[str, List[str], int]:
+    import random
+    q = _strip_leading_quiz_noise(question)
+    opts = [str(o).strip() for o in (options or []) if str(o).strip()]
+    if len(opts) < 2:
+        return q, opts, correct_option_id0
+    order = list(range(len(opts)))
+    random.shuffle(order)
+    shuffled = [opts[i] for i in order]
+    new_correct = -1
+    if 0 <= int(correct_option_id0) < len(opts):
+        try:
+            new_correct = order.index(int(correct_option_id0))
+        except Exception:
+            new_correct = -1
+    return q, shuffled, new_correct
+
+
+def _score_reply_text(total_posted: int) -> str:
+    return f"📝 Your score: ____ / {int(total_posted or 0)}"
+
+
+def quiz_to_poll_parts(payload: Dict[str, Any]) -> Tuple[str, List[str], int, str]:
+    q = str(payload.get("questions", "")).strip()
+    q2, expl2 = split_inline_explain(q)
+    if expl2 and not str(payload.get("explanation", "")).strip():
+        q = q2.strip()
+        payload = dict(payload)
+        payload["explanation"] = expl2.strip()
+    else:
+        q = q2.strip()
+    opts = [
+        str(payload.get("option1", "")).strip(),
+        str(payload.get("option2", "")).strip(),
+        str(payload.get("option3", "")).strip(),
+        str(payload.get("option4", "")).strip(),
+        str(payload.get("option5", "")).strip(),
+    ]
+    opts = [o for o in opts if o]
+    if len(opts) < 2:
+        if len(opts) == 0:
+            opts = ["Option A", "Option B"]
+        else:
+            opts = opts + ["Option B"]
+    if len(opts) > 10:
+        opts = opts[:10]
+    ans = int(payload.get("answer", 0) or 0)
+    correct_option_id = ans - 1 if 1 <= ans <= len(opts) else -1
+    explanation = str(payload.get("explanation", "")).strip()
+    q, opts, correct_option_id = _shuffle_quiz_payload(q, opts, correct_option_id)
+    return q, opts, correct_option_id, explanation
+
+
+@require_admin
+async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if not context.args or not context.args[0].isdigit():
+        await safe_reply(update, usage_box("post", "<DB-ID> [keep]", "Post buffered quizzes to a channel. Use 'keep' to keep buffer."))
+        return
+
+    cid = int(context.args[0])
+    keep = (len(context.args) > 1 and context.args[1].strip().lower() == "keep")
+    ch = channel_get_by_id_for_user(admin_id, cid)
+    if not ch:
+        await warn_html(update, "Channel Not Found", f"No access to that channel. Use <code>/listchannels</code> to view yours.")
+        return
+
+    items = buffer_list(admin_id, limit=MAX_BUFFERED_QUESTIONS)
+    if not items:
+        await warn(update, "Buffer Empty", "No quizzes to post. Send text or forward polls first.")
+        return
+
+    await info_html(update, "Posting to Channel", f"<code>{h(ch.title)}</code> — <code>{h(str(ch.channel_chat_id))}</code>\n\nPosting <code>{h(len(items))}</code> question(s)...")
+
+    posted_ids: List[int] = []
+    ok_count, fail_count = 0, 0
+    first_post_message_id = None
+
+    for (row_id, payload) in items:
+        try:
+            q, opts, correct_option_id, expl = quiz_to_poll_parts(payload)
+            prefix = (ch.prefix or "").strip(" ")
+            expl_link = (ch.expl_link or "").strip()
+            SEP = "\n\u200b"
+            q_final = f"{prefix}{SEP}{q}".strip() if prefix else q
+            if len(q_final) > 300:
+                q_final = q_final[:297] + "..."
+
+            expl_final = expl.strip()
+            if not explain_mode_on(admin_id):
+                expl_final = ""
+            if expl_link:
+                expl_final = (expl_final + "\n\n" if expl_final else "") + f"🔗 {expl_link}"
+            expl_final = expl_final.strip()
+            if len(expl_final) > 200:
+                expl_final = expl_final[:197] + "..."
+
+            if correct_option_id >= 0:
+                m = await context.bot.send_poll(
+                    chat_id=ch.channel_chat_id,
+                    question=q_final,
+                    options=opts,
+                    is_anonymous=True,
+                    type=Poll.QUIZ,
+                    correct_option_id=correct_option_id,
+                    explanation=expl_final if expl_final else None,
+                )
+            else:
+                m = await context.bot.send_poll(
+                    chat_id=ch.channel_chat_id,
+                    question=q_final,
+                    options=opts,
+                    is_anonymous=True,
+                    type=Poll.REGULAR,
+                )
+                if expl_final:
+                    await context.bot.send_message(chat_id=ch.channel_chat_id, text=f"📖 {expl_final}", disable_web_page_preview=True)
+
+            if first_post_message_id is None and getattr(m, 'message_id', None):
+                first_post_message_id = m.message_id
+            ok_count += 1
+            posted_ids.append(row_id)
+            await asyncio.sleep(POST_DELAY_SECONDS)
+        except RetryAfter as e:
+            await asyncio.sleep(float(e.retry_after) + 0.5)
+            fail_count += 1
+        except TelegramError as e:
+            fail_count += 1
+            db_log("ERROR", "post_failed", {"admin_id": admin_id, "channel": ch.channel_chat_id, "error": str(e)})
+        except Exception as e:
+            fail_count += 1
+            db_log("ERROR", "post_failed_unknown", {"admin_id": admin_id, "error": str(e)})
+
+    if ok_count > 0 and first_post_message_id:
+        with contextlib.suppress(Exception):
+            await context.bot.send_message(
+                chat_id=ch.channel_chat_id,
+                text=_score_reply_text(ok_count),
+                reply_to_message_id=first_post_message_id,
+                allow_sending_without_reply=True,
+            )
+
+    inc_admin_post(admin_id, ok_count)
+    if posted_ids and not keep:
+        buffer_remove_ids(admin_id, posted_ids)
+    body = f"Posted: {ok_count}\nFailed: {fail_count}\nRemaining in Buffer: {buffer_count(admin_id)}"
+    await ok(update, "Posting Complete", body)
+
+
+@require_admin
+async def cmd_postemoji(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if not context.args or not context.args[0].isdigit():
+        await safe_reply(update, usage_box("postemoji", "<DB-ID> [keep]", "Post buffered questions as emoji quiz to a channel"))
+        return
+    cid = int(context.args[0])
+    keep = (len(context.args) > 1 and context.args[1].strip().lower() == "keep")
+    ch = channel_get_by_id_for_user(admin_id, cid)
+    if not ch:
+        await warn(update, "Not Found", "Channel not found or no access.")
+        return
+    items = buffer_list(admin_id, limit=MAX_BUFFERED_QUESTIONS)
+    if not items:
+        await warn(update, "Buffer Empty", "No buffered questions found.")
+        return
+    prefix = str(getattr(ch, "prefix", "") or "").strip()
+    title = prefix if prefix else BOT_BRAND
+    sent = 0
+    sent_ids = []
+    first_post_message_id = None
+    for bid, payload in items:
+        qtext, opts, corr_idx0, explanation = quiz_to_poll_parts(payload)
+        if not opts:
+            continue
+        msg_text = _emoji_quiz_text(qtext, opts, title)
+        quiz_id = uuid.uuid4().hex[:10]
+        try:
+            m = await context.bot.send_message(
+                chat_id=ch.channel_chat_id,
+                text=msg_text,
+                reply_markup=emoji_quiz_keyboard(len(opts), quiz_id),
+                disable_web_page_preview=True,
+            )
+            if first_post_message_id is None:
+                first_post_message_id = m.message_id
+            sent += 1
+            sent_ids.append(bid)
+            emoji_quiz_save(
+                quiz_id,
+                ch.channel_chat_id,
+                m.message_id,
+                {
+                    "question": qtext,
+                    "options": opts,
+                    "correct_answer": corr_idx0 + 1 if corr_idx0 >= 0 else 0,
+                    "explanation": explanation,
+                    "prefix": title,
+                },
+                admin_id,
+            )
+            await asyncio.sleep(0.25)
+        except Exception as e:
+            db_log("ERROR", "postemoji_failed", {"admin_id": admin_id, "channel": getattr(ch, 'channel_chat_id', 0), "error": str(e)})
+    if sent > 0 and first_post_message_id:
+        with contextlib.suppress(Exception):
+            await context.bot.send_message(
+                chat_id=ch.channel_chat_id,
+                text=_score_reply_text(sent),
+                reply_to_message_id=first_post_message_id,
+                allow_sending_without_reply=True,
+            )
+    if sent and not keep:
+        buffer_remove_ids(admin_id, sent_ids)
+    await ok_html(update, "Emoji Quiz Posted", f"Sent: <code>{h(sent)}</code>\nChannel: <code>{h(getattr(ch, 'title', cid))}</code>")
+
+def build_app() -> Application:
+    db_init(); extra_db_init()
+    # keep original image extraction around for override wrapper
+    globals().setdefault("_original_handle_image", globals().get("handle_image"))
+    builder = ApplicationBuilder().token(BOT_TOKEN)
+    try:
+        builder = builder.concurrent_updates(64)
+    except Exception:
+        pass
+    app = builder.build()
+    app.add_handler(_cmdh("start", cmd_start))
+    app.add_handler(_cmdh("help", cmd_help))
+    app.add_handler(_cmdh("commands", cmd_commands))
+    app.add_handler(_cmdh("features", cmd_features))
+    app.add_handler(CallbackQueryHandler(on_solver_callback, pattern=r"^solve:"))
+    app.add_handler(CallbackQueryHandler(on_genquiz_callback, pattern=r"^genquiz:"))
+    app.add_handler(CallbackQueryHandler(on_emoji_quiz_callback, pattern=r"^eq:"))
+    app.add_handler(CallbackQueryHandler(on_required_verify_callback, pattern=r"^req:verify$"))
+    app.add_handler(_cmdh("ask", cmd_ask))
+    app.add_handler(_cmdh("scanhelp", cmd_scanhelp))
+    app.add_handler(_cmdh("vision_on", cmd_vision_on))
+    app.add_handler(_cmdh("vision_off", cmd_vision_off))
+    app.add_handler(_cmdh("solve_on", cmd_solve_on))
+    app.add_handler(_cmdh("solve_off", cmd_solve_off))
+    app.add_handler(_cmdh("himusai_on", cmd_himusai_on))
+    app.add_handler(_cmdh("himusai_off", cmd_himusai_off))
+    app.add_handler(_cmdh("probaho_on", cmd_probaho_on))
+    app.add_handler(_cmdh("probaho_off", cmd_probaho_off))
+    app.add_handler(_cmdh("explain_on", cmd_explain_on))
+    app.add_handler(_cmdh("explain_off", cmd_explain_off))
+    app.add_handler(_cmdh("quizprefix", cmd_quizprefix))
+    app.add_handler(_cmdh("quizlink", cmd_quizlink))
+    app.add_handler(_cmdh("addadmin", cmd_addadmin))
+    app.add_handler(_cmdh("removeadmin", cmd_removeadmin))
+    app.add_handler(_cmdh("grantall", cmd_grantall))
+    app.add_handler(_cmdh("revokeall", cmd_revokeall))
+    app.add_handler(_cmdh("grantvision", cmd_grantvision))
+    app.add_handler(_cmdh("revokevision", cmd_revokevision))
+    app.add_handler(_cmdh("addrequired", cmd_addrequired))
+    app.add_handler(_cmdh("delrequired", cmd_delrequired))
+    app.add_handler(_cmdh("listrequired", cmd_listrequired))
+    app.add_handler(_cmdh("ownerstats", cmd_ownerstats))
+    app.add_handler(_cmdh("users", cmd_users))
+    app.add_handler(_cmdh("usersd", cmd_usersd))
+    app.add_handler(_cmdh("filter", cmd_filter))
+    app.add_handler(_cmdh("done", cmd_done))
+    app.add_handler(_cmdh("clear", cmd_clear))
+    app.add_handler(_cmdh("addchannel", cmd_addchannel))
+    app.add_handler(_cmdh("listchannels", cmd_listchannels))
+    app.add_handler(_cmdh("removechannel", cmd_removechannel))
+    app.add_handler(_cmdh("setprefix", cmd_setprefix))
+    app.add_handler(_cmdh("setexplink", cmd_setexplink))
+    app.add_handler(_cmdh("post", cmd_post))
+    app.add_handler(_cmdh("postemoji", cmd_postemoji))
+    app.add_handler(_cmdh("broadcast", cmd_broadcast))
+    app.add_handler(_cmdh("adminpanel", cmd_adminpanel))
+    app.add_handler(_cmdh("reply", cmd_reply))
+    app.add_handler(_cmdh("close", cmd_close))
+    app.add_handler(_cmdh("ban", cmd_ban))
+    app.add_handler(_cmdh("unban", cmd_unban))
+    app.add_handler(_cmdh("banned", cmd_banned))
+    app.add_handler(_cmdh("private_send", cmd_private_send))
+    app.add_handler(_cmdh("send_private", cmd_private_send))
+    app.add_handler(MessageHandler(filters.POLL, handle_poll))
+    app.add_handler(MessageHandler(filters.POLL, handle_user_poll_solver), group=1)
+    app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_image))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_user_text_unusual), group=1)
+    app.add_error_handler(on_error)
+    return app
+
 def main():
     app = build_app()
+    # Render free web service port binding
+    try:
+        threading.Thread(target=_run_render_health_server, daemon=True).start()
+    except Exception:
+        logging.exception("Failed to start Render health server")
+
+  
     try:
         # Attempt to reconfigure stdout to UTF-8 encoding for Windows compatibility
         if hasattr(sys.stdout, 'reconfigure'):
@@ -4816,13 +8191,1190 @@ def main():
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
+# ===========================
+# FINAL PATCHES (2026-03-13)
+# ===========================
+
+def _profile_link_keyboard(user_id: int, username: Optional[str] = None) -> Optional[InlineKeyboardMarkup]:
+    """Safer profile keyboard: only public username links are used.
+    tg://user buttons can fail with Button_user_privacy_restricted.
+    """
+    un = str(username or '').lstrip('@').strip()
+    if not un:
+        return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"👤 Open @{un}", url=f"https://t.me/{un}")]])
+
+
+@require_admin
+async def cmd_usersd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not str(context.args[0]).lstrip('-').isdigit():
+        await safe_reply(update, usage_box("usersd", "<user_id>", "Show user details and a public profile button if available"))
+        return
+    target = int(context.args[0])
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT first_name, username, role, is_banned, created_at, last_seen_at FROM users WHERE user_id=?", (target,))
+    row = cur.fetchone(); conn.close()
+    if row:
+        name = row["first_name"] or str(target)
+        username = row["username"] or ""
+        uname = ("@" + username) if username else "(no public username)"
+        body = (
+            f"Profile: {mention_user(target, name)}\n"
+            f"User ID: <code>{h(target)}</code>\n"
+            f"Username: {h(uname)}\n"
+            f"Role: <code>{h(row['role'] or 'USER')}</code>\n"
+            f"Banned: <code>{'Yes' if int(row['is_banned'] or 0) else 'No'}</code>\n"
+            f"Created: <code>{h(row['created_at'] or '')}</code>\n"
+            f"Last Seen: <code>{h(row['last_seen_at'] or '')}</code>"
+        )
+        kb = _profile_link_keyboard(target, username)
+        if not kb:
+            body += "\n\n⚠️ Public profile button unavailable for this user."
+    else:
+        body = (
+            f"Profile: {mention_user(target, str(target))}\n"
+            f"User ID: <code>{h(target)}</code>\n"
+            f"Stored info: <code>Not found in local users table</code>\n\n"
+            f"⚠️ Public profile button unavailable unless the user has a username."
+        )
+        kb = None
+    await update.message.reply_text(
+        ui_box_html("User Details", body, emoji="🔎"),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+        disable_web_page_preview=True,
+    )
+
+
+def _buffer_feedback_key(chat_id: int, user_id: int) -> str:
+    return f"_buffer_feedback:{int(chat_id)}:{int(user_id)}"
+
+
+async def _show_buffer_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE, title: str, body_html: str, emoji: str = "✅") -> None:
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat_id = int(update.effective_chat.id)
+    uid = int(update.effective_user.id)
+    lock = _get_chat_lock(context, chat_id)
+    async with lock:
+        key = _buffer_feedback_key(chat_id, uid)
+        prev_mid = context.application.bot_data.get(key)
+        if isinstance(prev_mid, int):
+            with contextlib.suppress(Exception):
+                await context.bot.delete_message(chat_id=chat_id, message_id=prev_mid)
+        msg = await update.message.reply_text(
+            ui_box_html(title, body_html, emoji=emoji),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        context.application.bot_data[key] = int(msg.message_id)
+
+
+@require_admin_silent
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    uid = update.effective_user.id if update.effective_user else 0
+    if not uid or is_banned(uid):
+        return
+    role = get_role(uid)
+    if role not in (ROLE_ADMIN, ROLE_OWNER):
+        return
+    if is_private_chat(update) and (solver_mode_on(uid) or himusai_mode_on(uid)):
+        return
+    text = update.message.text or ""
+    if not text.strip():
+        return
+    if buffer_count(uid) >= MAX_BUFFERED_QUESTIONS:
+        await warn(update, "Buffer Limit Reached", f"You have {MAX_BUFFERED_QUESTIONS} questions buffered.\n\nUse /done to export or /clear to reset.")
+        return
+    blocks = split_blocks(text)
+    added = 0
+    for b in blocks:
+        if buffer_count(uid) >= MAX_BUFFERED_QUESTIONS:
+            break
+        try:
+            payload = parse_text_block(b, uid)
+            if payload:
+                buffer_add(uid, payload)
+                added += 1
+        except Exception as e:
+            db_log("ERROR", "parse_text_failed", {"admin_id": uid, "error": str(e)})
+    if added:
+        await _show_buffer_feedback(
+            update,
+            context,
+            "Added to Buffer",
+            f"<code>{h(added)}</code> question(s) added.\n\nTotal buffered: <code>{h(buffer_count(uid))}</code>",
+        )
+    else:
+        await warn(update, "No Questions Found", "No valid quiz blocks detected. Check formatting.")
+
+
+@require_admin_silent
+async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update)
+    uid = update.effective_user.id if update.effective_user else 0
+    if not uid or is_banned(uid):
+        return
+    role = get_role(uid)
+    if role not in (ROLE_ADMIN, ROLE_OWNER):
+        return
+    if is_private_chat(update) and (solver_mode_on(uid) or himusai_mode_on(uid)):
+        return
+    poll = update.message.poll
+    question = clean_common(poll.question or "", uid)
+    options = [o.text for o in poll.options]
+    opts = options + [""] * (5 - len(options))
+    explanation = ""
+    if hasattr(poll, "explanation") and poll.explanation:
+        explanation = clean_explanation(poll.explanation, uid)
+    correct_answer_id = 0
+    if poll.type == "quiz" and poll.correct_option_id is not None:
+        correct_answer_id = int(poll.correct_option_id) + 1
+    payload = {
+        "questions": question,
+        "option1": (opts[0] or "").strip(),
+        "option2": (opts[1] or "").strip(),
+        "option3": (opts[2] or "").strip(),
+        "option4": (opts[3] or "").strip(),
+        "option5": (opts[4] or "").strip(),
+        "answer": correct_answer_id,
+        "explanation": explanation,
+        "type": 1,
+        "section": 1,
+    }
+    if buffer_count(uid) >= MAX_BUFFERED_QUESTIONS:
+        await warn_html(update, "Buffer Limit Reached", f"You have <code>{h(MAX_BUFFERED_QUESTIONS)}</code> questions buffered.\n\nUse <code>/done</code> to export or <code>/clear</code> to reset.")
+        return
+    buffer_add(uid, payload)
+    note = ""
+    if correct_answer_id == 0 and poll.type == "quiz":
+        note = "<br><br>⚠️ Telegram may hide the correct answer in forwarded quizzes. Export will store <code>answer=0</code>."
+    await _show_buffer_feedback(
+        update,
+        context,
+        "Poll Saved",
+        f"Total buffered: <code>{buffer_count(uid)}</code>{note}",
+    )
+
+
+@require_admin
+async def cmd_buffercount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    cnt = buffer_count(uid)
+    items = buffer_list(uid, limit=3)
+    preview = []
+    for rid, payload in items:
+        q = str(payload.get('questions', '') or '').strip()
+        if q:
+            preview.append(f"• <code>{rid}</code> — {h(q[:70])}{'...' if len(q) > 70 else ''}")
+    body = f"Total buffered: <code>{cnt}</code>"
+    if preview:
+        body += "\n\nLatest items:\n" + "\n".join(preview)
+    await info_html(update, "Buffer Status", body)
+
+
+@require_admin
+async def cmd_imgreact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id if update.effective_user else 0
+    if not context.args or len(context.args) < 2 or not str(context.args[0]).isdigit() or not str(context.args[1]).isdigit():
+        await safe_reply(update, usage_box("imgreact", "<DB-ID> <correct_emoji_no 1-4> [explanation]", "Reply to a photo/image and post it as an image reaction quiz"))
+        return
+    cid = int(context.args[0])
+    corr = int(context.args[1])
+    if corr < 1 or corr > 4:
+        await warn(update, "Invalid Answer", "correct_emoji_no must be between 1 and 4.")
+        return
+    ch = channel_get_by_id_for_user(admin_id, cid)
+    if not ch:
+        await warn(update, "Not Found", "Channel not found or no access.")
+        return
+    if not update.message or not update.message.reply_to_message:
+        await warn(update, "Reply Required", "Reply to a photo/image message with /imgreact <DB-ID> <correct_emoji_no> [explanation]")
+        return
+    src = update.message.reply_to_message
+    photo_file_id = None
+    if getattr(src, 'photo', None):
+        photo_file_id = src.photo[-1].file_id
+    elif getattr(src, 'document', None) and str(getattr(src.document, 'mime_type', '')).startswith('image/'):
+        photo_file_id = src.document.file_id
+    if not photo_file_id:
+        await warn(update, "Image Required", "Reply to a photo or image document.")
+        return
+    explanation = " ".join(context.args[2:]).strip()
+    prefix = str(getattr(ch, 'prefix', '') or '').strip() or BOT_BRAND
+    caption_parts = [prefix]
+    src_caption = str(getattr(src, 'caption', '') or '').strip()
+    if src_caption:
+        caption_parts.append(src_caption)
+    caption = "\n".join([p for p in caption_parts if p]).strip()
+    quiz_id = uuid.uuid4().hex[:10]
+    try:
+        m = await context.bot.send_photo(
+            chat_id=ch.channel_chat_id,
+            photo=photo_file_id,
+            caption=caption[:1024] if caption else None,
+            reply_markup=emoji_quiz_keyboard(4, quiz_id),
+        )
+        emoji_quiz_save(
+            quiz_id,
+            ch.channel_chat_id,
+            m.message_id,
+            {
+                "question": src_caption,
+                "options": EMOJI_BUTTONS[:4],
+                "correct_answer": corr,
+                "explanation": explanation,
+                "prefix": prefix,
+                "image_file_id": photo_file_id,
+                "image_mode": 1,
+            },
+            admin_id,
+        )
+        await ok_html(update, "Image Reaction Quiz Posted", f"Channel: <code>{h(getattr(ch, 'title', cid))}</code>")
+    except Exception as e:
+        db_log("ERROR", "imgreact_failed", {"admin_id": admin_id, "channel": getattr(ch, 'channel_chat_id', 0), "error": str(e)})
+        await err(update, "Post Failed", str(e)[:180])
+
+
+_old_build_app = build_app
+
+def build_app() -> Application:
+    app = _old_build_app()
+    app.add_handler(_cmdh("emojipost", cmd_postemoji))
+    app.add_handler(_cmdh("buffercount", cmd_buffercount))
+    app.add_handler(_cmdh("imgreact", cmd_imgreact))
+    return app
+
+
+
+
+# ===========================
+# FINAL PATCHES V4 (2026-03-13)
+# ===========================
+
+def _final_user_command_set() -> set[str]:
+    return {"/start", "/help", "/commands", "/ask", "/solve_on", "/solve_off"}
+
+
+def _all_commands_for(user_id: int):
+    role = get_role(user_id)
+    sections = []
+    user_cmds = [
+        ("/start", "Welcome / membership check"),
+        ("/help", "Show detailed command guide"),
+        ("/commands", "Show all available commands"),
+        ("/ask", "Contact support (text or reply to file/photo)"),
+        ("/solve_on", "Enable user AI solving"),
+        ("/solve_off", "Disable user AI solving"),
+    ]
+    sections.append(("👤 User Commands", user_cmds))
+    if role in (ROLE_ADMIN, ROLE_OWNER):
+        admin_cmds = [
+            ("/himusai_on", "Enable admin/owner inbox AI mode"),
+            ("/himusai_off", "Disable admin/owner inbox AI mode"),
+            ("/probaho_on", "Enable AI in current group (group admin)"),
+            ("/probaho_off", "Disable AI in current group (group admin)"),
+            ("/filter", "Add parsing filter phrase"),
+            ("/clear", "Clear your buffer"),
+            ("/done", "Export your buffered quizzes"),
+            ("/buffercount", "Show total buffered quizzes"),
+            ("/addchannel", "Add a channel/group for posting"),
+            ("/listchannels", "List your channels/groups"),
+            ("/removechannel", "Remove a channel/group"),
+            ("/setprefix", "Set or clear channel prefix"),
+            ("/setexplink", "Set or clear explanation link"),
+            ("/post", "Post buffered quizzes to a channel"),
+            ("/postemoji", "Post buffered emoji quizzes to a channel"),
+            ("/emojipost", "Alias of /postemoji"),
+            ("/imgreact", "Post image-based reaction quiz by replying to a photo"),
+            ("/broadcast", "Broadcast a message"),
+            ("/adminpanel", "View posting/admin stats"),
+            ("/reply", "Reply to a support ticket"),
+            ("/close", "Close a support ticket"),
+            ("/ban", "Ban a user"),
+            ("/unban", "Unban a user"),
+            ("/banned", "View banned users"),
+            ("/private_send", "Send a private message to a user"),
+            ("/usersd", "Show user details / open profile if public"),
+            ("/vision_on", "Enable image extraction mode"),
+            ("/vision_off", "Disable image extraction mode"),
+            ("/scanhelp", "Show image extraction help"),
+            ("/explain_on", "Enable explanation in quiz + export"),
+            ("/explain_off", "Disable explanation in quiz + export"),
+        ]
+        sections.append(("🛠 Staff Commands", admin_cmds))
+    if role == ROLE_OWNER:
+        owner_cmds = [
+            ("/addadmin", "Promote a user to admin"),
+            ("/removeadmin", "Remove admin role"),
+            ("/grantall", "Grant admin all-channel access"),
+            ("/revokeall", "Revoke all-channel access"),
+            ("/grantvision", "Grant image extraction access"),
+            ("/revokevision", "Revoke image extraction access"),
+            ("/addrequired", "Add required channel/group"),
+            ("/delrequired", "Remove required channel/group"),
+            ("/listrequired", "List required channels/groups"),
+            ("/ownerstats", "Owner dashboard"),
+            ("/users", "Export started users JSON"),
+            ("/quizprefix", "Set generated quiz prefix"),
+            ("/quizlink", "Set generated quiz link"),
+        ]
+        sections.append(("👑 Owner Commands", owner_cmds))
+    return sections
+
+
+@require_admin
+async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    items = buffer_list(uid, limit=99999)
+    if not items:
+        await warn(update, "Buffer Empty", "No questions to export. Use /add or send quizzes first.")
+        return
+    rows = [payload for (_id, payload) in items]
+    norm_rows = []
+    explanations_enabled = explain_mode_on(uid)
+    for r in rows:
+        q = str(r.get("questions", "") or "")
+        e = str(r.get("explanation", "") or "")
+        q2, expl2 = split_inline_explain(q)
+        if expl2 and not e.strip():
+            e = expl2
+        rr = dict(r)
+        rr["questions"] = q2.strip()
+        rr["explanation"] = e.strip() if explanations_enabled else ""
+        norm_rows.append(rr)
+    rows = norm_rows
+    df = pd.DataFrame(rows)
+    cols = ["questions", "option1", "option2", "option3", "option4", "option5", "answer", "explanation", "type", "section"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[cols]
+    with tempfile.NamedTemporaryFile("w+b", suffix=".csv", delete=False) as f:
+        path = f.name
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+
+    def _ans_to_letter(n: int) -> str:
+        return {1: "A", 2: "B", 3: "C", 4: "D", 5: "E"}.get(int(n or 0), "")
+
+    quiz_json = []
+    for idx, r in enumerate(rows, start=1):
+        opts_map = {"A": r.get("option1", ""), "B": r.get("option2", ""), "C": r.get("option3", ""), "D": r.get("option4", "")}
+        if str(r.get("option5", "")).strip():
+            opts_map["E"] = r.get("option5", "")
+        quiz_json.append({
+            "serial": idx,
+            "question": r.get("questions", ""),
+            "options": opts_map,
+            "correct_answer": _ans_to_letter(r.get("answer", 0)),
+            "explanation": r.get("explanation", "") if explanations_enabled else "",
+        })
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as jf:
+        json_path = jf.name
+        json.dump(quiz_json, jf, ensure_ascii=False, indent=2)
+    try:
+        await update.message.reply_document(document=open(path, "rb"), caption=f"<b>✅ CSV Export</b>\n<i>{len(df)} questions exported</i>", parse_mode=ParseMode.HTML)
+        await update.message.reply_document(document=open(json_path, "rb"), caption="<b>✅ JSON Export</b>", parse_mode=ParseMode.HTML)
+        await ok_html(update, "Export Complete", f"CSV + JSON ready. <code>{h(len(df))}</code> questions exported.")
+    finally:
+        with contextlib.suppress(Exception): os.remove(path)
+        with contextlib.suppress(Exception): os.remove(json_path)
+    buffer_clear(uid)
+
+
+@require_owner
+async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not str(context.args[0]).lstrip('-').isdigit():
+        await safe_reply(update, usage_box("addadmin", "<user_id>", "Promote a user to admin"))
+        return
+    target = int(context.args[0])
+    if target == OWNER_ID:
+        await warn(update, "Not Needed", "Owner already has full access.")
+        return
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("UPDATE users SET role=? WHERE user_id=?", (ROLE_ADMIN, target))
+    if cur.rowcount == 0:
+        cur.execute(
+            "INSERT OR REPLACE INTO users(user_id, role, first_name, username, is_banned, created_at, can_view_all, can_use_vision, last_seen_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (target, ROLE_ADMIN, "", None, 0, now_iso(), 0, 0, now_iso()),
+        )
+    conn.commit(); conn.close()
+    await ok(update, "Admin Added", f"User <code>{h(target)}</code> promoted to ADMIN.")
+
+
+_prev_build_app_v4 = build_app
+
+def build_app() -> Application:
+    app = _prev_build_app_v4()
+    return app
+
+
+
+# ===== FINAL OVERRIDES v5 =====
+
+def _normalize_emoji_quiz_parts(payload: Dict[str, Any]) -> Tuple[str, List[str], int, str]:
+    q, opts, correct_option_id, explanation = quiz_to_poll_parts(payload)
+    opts = [str(o).strip() for o in (opts or []) if str(o).strip()]
+    if len(opts) > len(EMOJI_BUTTONS):
+        opts = opts[:len(EMOJI_BUTTONS)]
+        if correct_option_id >= len(opts):
+            correct_option_id = -1
+    if len(opts) < 2:
+        return q, [], -1, explanation
+    return q, opts, correct_option_id, explanation
+
+
+@require_admin
+async def cmd_setexplink(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not context.args or not str(context.args[0]).isdigit():
+        await safe_reply(update, usage_box("setexplink", "<DB-ID> [text]", "Set or clear the explanation tail text for a channel"))
+        return
+    cid = int(context.args[0])
+    new_link = " ".join(context.args[1:]).strip() if len(context.args) > 1 else ""
+    ch = channel_get_by_id_for_user(uid, cid)
+    if not ch:
+        await warn(update, "Not Found", "Channel not found or you don't have access.")
+        return
+    old_link = getattr(ch, "expl_link", "") or "(empty)"
+    ok2 = channel_set_expl_link(cid, new_link)
+    if ok2:
+        shown = new_link if new_link else "(empty)"
+        body = (
+            f"Channel: {h(getattr(ch, 'title', cid))}\n"
+            f"DB-ID: {h(cid)}\n"
+            f"Old Text: {h(old_link)}\n"
+            f"New Text: {h(shown)}"
+        )
+        await ok(update, "Explanation Text Updated", body)
+    else:
+        await err(update, "Update Failed", "Could not update the explanation text.")
+
+
+@require_admin
+async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if not context.args or not context.args[0].isdigit():
+        await safe_reply(update, usage_box("post", "<DB-ID> [keep]", "Post buffered quizzes to a channel. Use 'keep' to keep buffer."))
+        return
+
+    cid = int(context.args[0])
+    keep = (len(context.args) > 1 and context.args[1].strip().lower() == "keep")
+    ch = channel_get_by_id_for_user(admin_id, cid)
+    if not ch:
+        await warn_html(update, "Channel Not Found", f"No access to that channel. Use <code>/listchannels</code> to view yours.")
+        return
+
+    items = buffer_list(admin_id, limit=MAX_BUFFERED_QUESTIONS)
+    if not items:
+        await warn(update, "Buffer Empty", "No quizzes to post. Send text or forward polls first.")
+        return
+
+    await info_html(update, "Posting to Channel", f"<code>{h(ch.title)}</code> — <code>{h(str(ch.channel_chat_id))}</code>\n\nPosting <code>{h(len(items))}</code> question(s)...")
+
+    posted_ids: List[int] = []
+    ok_count, fail_count = 0, 0
+    first_post_message_id = None
+
+    for (row_id, payload) in items:
+        try:
+            q, opts, correct_option_id, expl = quiz_to_poll_parts(payload)
+            if len(opts) < 2:
+                continue
+            prefix = (ch.prefix or "").strip(" ")
+            expl_tail = (ch.expl_link or "").strip()
+            SEP = "\n\u200b"
+            q_final = f"{prefix}{SEP}{q}".strip() if prefix else q
+            if len(q_final) > 300:
+                q_final = q_final[:297] + "..."
+
+            expl_final = expl.strip()
+            if not explain_mode_on(admin_id):
+                expl_final = ""
+            if expl_tail:
+                expl_final = (expl_final + "\n\n" if expl_final else "") + expl_tail
+            expl_final = expl_final.strip()
+            if len(expl_final) > 200:
+                expl_final = expl_final[:197] + "..."
+
+            if correct_option_id >= 0:
+                m = await context.bot.send_poll(
+                    chat_id=ch.channel_chat_id,
+                    question=q_final,
+                    options=opts,
+                    is_anonymous=True,
+                    type=Poll.QUIZ,
+                    correct_option_id=correct_option_id,
+                    explanation=expl_final if expl_final else None,
+                )
+            else:
+                m = await context.bot.send_poll(
+                    chat_id=ch.channel_chat_id,
+                    question=q_final,
+                    options=opts,
+                    is_anonymous=True,
+                    type=Poll.REGULAR,
+                )
+                if expl_final:
+                    await context.bot.send_message(chat_id=ch.channel_chat_id, text=expl_final, disable_web_page_preview=True)
+
+            if first_post_message_id is None and getattr(m, 'message_id', None):
+                first_post_message_id = m.message_id
+            ok_count += 1
+            posted_ids.append(row_id)
+            await asyncio.sleep(POST_DELAY_SECONDS)
+        except RetryAfter as e:
+            await asyncio.sleep(float(e.retry_after) + 0.5)
+            fail_count += 1
+        except TelegramError as e:
+            fail_count += 1
+            db_log("ERROR", "post_failed", {"admin_id": admin_id, "channel": ch.channel_chat_id, "error": str(e)})
+        except Exception as e:
+            fail_count += 1
+            db_log("ERROR", "post_failed_unknown", {"admin_id": admin_id, "error": str(e)})
+
+    if ok_count > 0 and first_post_message_id:
+        with contextlib.suppress(Exception):
+            await context.bot.send_message(
+                chat_id=ch.channel_chat_id,
+                text=_score_reply_text(ok_count),
+                reply_to_message_id=first_post_message_id,
+                allow_sending_without_reply=True,
+            )
+
+    inc_admin_post(admin_id, ok_count)
+    if posted_ids and not keep:
+        buffer_remove_ids(admin_id, posted_ids)
+    body = f"Posted: {ok_count}\nFailed: {fail_count}\nRemaining in Buffer: {buffer_count(admin_id)}"
+    await ok(update, "Posting Complete", body)
+
+
+@require_admin
+async def cmd_postemoji(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if not context.args or not context.args[0].isdigit():
+        await safe_reply(update, usage_box("postemoji", "<DB-ID> [keep]", "Post buffered questions as emoji quiz to a channel"))
+        return
+    cid = int(context.args[0])
+    keep = (len(context.args) > 1 and context.args[1].strip().lower() == "keep")
+    ch = channel_get_by_id_for_user(admin_id, cid)
+    if not ch:
+        await warn(update, "Not Found", "Channel not found or no access.")
+        return
+    items = buffer_list(admin_id, limit=MAX_BUFFERED_QUESTIONS)
+    if not items:
+        await warn(update, "Buffer Empty", "No buffered questions found.")
+        return
+    prefix = str(getattr(ch, "prefix", "") or "").strip()
+    title = prefix if prefix else BOT_BRAND
+    sent = 0
+    sent_ids: List[int] = []
+    first_post_message_id = None
+    fail_count = 0
+    for bid, payload in items:
+        qtext, opts, corr_idx0, explanation = _normalize_emoji_quiz_parts(payload)
+        if len(opts) < 2:
+            fail_count += 1
+            continue
+        msg_text = _emoji_quiz_text(qtext, opts, title)
+        quiz_id = uuid.uuid4().hex[:10]
+        try:
+            m = await context.bot.send_message(
+                chat_id=ch.channel_chat_id,
+                text=msg_text,
+                reply_markup=emoji_quiz_keyboard(len(opts), quiz_id),
+                disable_web_page_preview=True,
+            )
+            if first_post_message_id is None:
+                first_post_message_id = m.message_id
+            sent += 1
+            sent_ids.append(bid)
+            emoji_quiz_save(
+                quiz_id,
+                ch.channel_chat_id,
+                m.message_id,
+                {
+                    "question": qtext,
+                    "options": opts,
+                    "correct_answer": corr_idx0 + 1 if corr_idx0 >= 0 else 0,
+                    "explanation": explanation,
+                    "prefix": title,
+                },
+                admin_id,
+            )
+            await asyncio.sleep(0.30)
+        except RetryAfter as e:
+            await asyncio.sleep(float(getattr(e, 'retry_after', 1.0)) + 0.5)
+            try:
+                m = await context.bot.send_message(
+                    chat_id=ch.channel_chat_id,
+                    text=msg_text,
+                    reply_markup=emoji_quiz_keyboard(len(opts), quiz_id),
+                    disable_web_page_preview=True,
+                )
+                if first_post_message_id is None:
+                    first_post_message_id = m.message_id
+                sent += 1
+                sent_ids.append(bid)
+                emoji_quiz_save(
+                    quiz_id,
+                    ch.channel_chat_id,
+                    m.message_id,
+                    {
+                        "question": qtext,
+                        "options": opts,
+                        "correct_answer": corr_idx0 + 1 if corr_idx0 >= 0 else 0,
+                        "explanation": explanation,
+                        "prefix": title,
+                    },
+                    admin_id,
+                )
+            except Exception as e2:
+                fail_count += 1
+                db_log("ERROR", "postemoji_failed_retry", {"admin_id": admin_id, "channel": getattr(ch, 'channel_chat_id', 0), "error": str(e2), "buffer_id": bid})
+        except Exception as e:
+            fail_count += 1
+            db_log("ERROR", "postemoji_failed", {"admin_id": admin_id, "channel": getattr(ch, 'channel_chat_id', 0), "error": str(e), "buffer_id": bid})
+
+    if sent > 0 and first_post_message_id:
+        with contextlib.suppress(Exception):
+            await context.bot.send_message(
+                chat_id=ch.channel_chat_id,
+                text=_score_reply_text(sent),
+                reply_to_message_id=first_post_message_id,
+                allow_sending_without_reply=True,
+            )
+    if sent_ids and not keep:
+        buffer_remove_ids(admin_id, sent_ids)
+    await ok_html(update, "Emoji Quiz Posted", f"Sent: <code>{h(sent)}</code>\nFailed: <code>{h(fail_count)}</code>\nChannel: <code>{h(getattr(ch, 'title', cid))}</code>")
+
+# ===== END FINAL OVERRIDES v5 =====
+
+
+
+# ===== ULTRA GROUP/MAINTENANCE PATCH v6 =====
+from telegram.ext import ApplicationHandlerStop
+
+# Registry refresh
+try:
+    COMMANDS_REGISTRY.setdefault("public", {}).setdefault("commands", {}).update({
+        "start": "Welcome / membership check (private only)",
+        "help": "Show command guide (private only)",
+        "commands": "Show available commands (private only)",
+        "ask": "Contact support from inbox",
+        "solve_on": "Enable private user AI solving",
+        "solve_off": "Disable private user AI solving",
+    })
+    COMMANDS_REGISTRY.setdefault("admin", {}).setdefault("commands", {}).update({
+        "buffercount": "Show total buffered quizzes",
+        "postemoji": "Post buffered emoji quizzes to channel",
+        "emojipost": "Alias of /postemoji",
+        "imgreact": "Post image reaction quiz (reply to image)",
+        "usersd": "Show stored user details",
+        "probaho_on": "Enable /sh AI in current group",
+        "probaho_off": "Disable /sh AI in current group",
+        "porag": "Delete a replied message range in group",
+        "tutorial": "Show group usage tutorial",
+    })
+    COMMANDS_REGISTRY.setdefault("owner", {}).setdefault("commands", {}).update({
+        "maintenance_on": "Enable maintenance mode and notify users",
+        "maintenance_off": "Disable maintenance mode and notify users",
+    })
+    if "workflow" in COMMANDS_REGISTRY:
+        COMMANDS_REGISTRY["workflow"]["items"] = [
+            "Private inbox only -> parse text / polls / images into buffer",
+            "/done -> Export CSV and clear buffer",
+            "/post <DB-ID> -> Publish normal quizzes to channel",
+            "/postemoji <DB-ID> -> Publish emoji quizzes to channel",
+            "Group mode: /probaho_on then members use /sh to ask AI",
+        ]
+except Exception:
+    pass
+
+
+def maintenance_mode_on() -> bool:
+    return get_setting("maintenance_mode", "0") == "1"
+
+
+def maintenance_message() -> str:
+    return get_setting("maintenance_message", "Bot is under maintenance. Please try again later.")
+
+
+def set_maintenance_mode(value: bool, message: str = "") -> None:
+    set_setting("maintenance_mode", "1" if value else "0")
+    if message is not None:
+        set_setting("maintenance_message", message or "Bot is under maintenance. Please try again later.")
+
+
+async def _dm_text(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, reply_markup=None) -> bool:
+    try:
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=reply_markup,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _broadcast_private(context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    conn = db_connect(); cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users")
+    ids = [int(r[0]) for r in cur.fetchall()]
+    conn.close()
+    sent = 0
+    for uid in ids:
+        if await _dm_text(context, uid, text):
+            sent += 1
+        await asyncio.sleep(0.03)
+    return sent
+
+
+async def _auto_delete_after(bot, chat_id: int, message_ids: list[int], delay_seconds: int = 300) -> None:
+    await asyncio.sleep(delay_seconds)
+    for mid in message_ids:
+        with contextlib.suppress(Exception):
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+
+
+async def _is_group_admin_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    if is_owner(user_id) or is_admin(user_id):
+        return True
+    try:
+        cm = await context.bot.get_chat_member(chat_id, user_id)
+        st = str(getattr(cm, "status", ""))
+        return st in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+def _extract_command_name(text: str) -> str:
+    t = (text or "").strip().split()[0] if (text or "").strip() else ""
+    t = t.split("@")[0]
+    return t.lstrip("/").lower()
+
+
+async def global_maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not maintenance_mode_on():
+        return
+    uid = update.effective_user.id if update.effective_user else 0
+    if not uid or is_owner(uid):
+        return
+    msg = ui_box_html("Maintenance Mode", h(maintenance_message()), emoji="🛠")
+    if update.effective_chat and update.effective_chat.type == "private":
+        with contextlib.suppress(Exception):
+            await safe_reply(update, msg)
+    else:
+        await _dm_text(context, uid, msg)
+    raise ApplicationHandlerStop
+
+
+async def group_command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat or update.effective_chat.type not in ("group", "supergroup"):
+        return
+    cmd = _extract_command_name(update.message.text or "")
+    allowed = {"probaho_on", "probaho_off", "sh", "porag", "tutorial"}
+    if cmd and cmd not in allowed:
+        raise ApplicationHandlerStop
+
+
+@require_owner
+async def cmd_maintenance_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = " ".join(context.args).strip() or "Bot maintenance চলছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।"
+    set_maintenance_mode(True, msg)
+    sent = await _broadcast_private(context, ui_box_html("Maintenance Mode", h(msg), emoji="🛠"))
+    await ok(update, "Maintenance Enabled", f"Message sent to: {sent}")
+
+
+@require_owner
+async def cmd_maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_maintenance_mode(False, "")
+    sent = await _broadcast_private(context, ui_box_html("Service Resumed", "Bot is now active again.", emoji="✅"))
+    await ok(update, "Maintenance Disabled", f"Resume message sent to: {sent}")
+
+
+@require_admin
+async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    items = buffer_list(uid, limit=99999)
+    if not items:
+        await warn(update, "Buffer Empty", "No questions to export. Use /add or send quizzes first.")
+        return
+    rows = []
+    for _id, payload in items:
+        q = str(payload.get("questions", "") or "")
+        e = str(payload.get("explanation", "") or "")
+        q2, expl2 = split_inline_explain(q)
+        if expl2 and not e.strip():
+            e = expl2
+        rr = dict(payload)
+        rr["questions"] = q2.strip()
+        rr["explanation"] = (e.strip() if explain_mode_on(uid) else "")
+        rows.append(rr)
+    df = pd.DataFrame(rows)
+    cols = ["questions", "option1", "option2", "option3", "option4", "option5", "answer", "explanation", "type", "section"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[cols]
+    with tempfile.NamedTemporaryFile("w+b", suffix=".csv", delete=False) as tf:
+        csv_path = tf.name
+    try:
+        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        with open(csv_path, "rb") as rf:
+            await context.bot.send_document(
+                chat_id=uid,
+                document=rf,
+                filename="probaho_export.csv",
+                caption=f"Exported {len(df)} question(s)",
+            )
+        buffer_clear(uid)
+        await ok(update, "Export Complete", f"CSV exported successfully.\n\nExported: {len(df)}\nBuffer cleared.")
+    finally:
+        with contextlib.suppress(Exception):
+            os.unlink(csv_path)
+
+
+async def cmd_probaho_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    uid = update.effective_user.id if update.effective_user else 0
+    if not chat or chat.type not in ("group", "supergroup"):
+        if update.message:
+            await warn(update, "Group Only", "Use this command inside a group/supergroup.")
+        return
+    if not await _is_group_admin_user(context, chat.id, uid):
+        await _dm_text(context, uid, ui_box_html("Unauthorized", "Only a group admin or the bot owner can use this command.", emoji="⚠️"))
+        with contextlib.suppress(Exception):
+            await update.message.delete()
+        return
+    set_group_ai_enabled(chat.id, True)
+    with contextlib.suppress(Exception):
+        await update.message.delete()
+    await _dm_text(context, uid, ui_box_html("Group AI Enabled", f"Group: <code>{h(chat.id)}</code>\nMode: members can use <code>/sh</code> in this group.", emoji="✅"))
+
+
+async def cmd_probaho_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    uid = update.effective_user.id if update.effective_user else 0
+    if not chat or chat.type not in ("group", "supergroup"):
+        if update.message:
+            await warn(update, "Group Only", "Use this command inside a group/supergroup.")
+        return
+    if not await _is_group_admin_user(context, chat.id, uid):
+        await _dm_text(context, uid, ui_box_html("Unauthorized", "Only a group admin or the bot owner can use this command.", emoji="⚠️"))
+        with contextlib.suppress(Exception):
+            await update.message.delete()
+        return
+    set_group_ai_enabled(chat.id, False)
+    with contextlib.suppress(Exception):
+        await update.message.delete()
+    await _dm_text(context, uid, ui_box_html("Group AI Disabled", f"Group: <code>{h(chat.id)}</code>\nThe <code>/sh</code> AI command is now off in this group.", emoji="✅"))
+
+
+def _poll_text_for_sh(poll) -> tuple[str, list[str], str]:
+    qtext = str(getattr(poll, 'question', '') or '').strip()
+    options = [str(o.text).strip() for o in getattr(poll, 'options', [])]
+    expl = str(getattr(poll, 'explanation', '') or '').strip()
+    return qtext, options, expl
+
+
+async def cmd_sh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat or update.effective_chat.type not in ("group", "supergroup"):
+        return
+    uid = update.effective_user.id if update.effective_user else 0
+    chat_id = int(update.effective_chat.id)
+    if not is_group_ai_enabled(chat_id):
+        with contextlib.suppress(Exception):
+            await update.message.delete()
+        return
+    if is_banned(uid):
+        with contextlib.suppress(Exception):
+            await update.message.delete()
+        return
+    ok, missing = await user_meets_required_memberships(context, uid)
+    if not ok and not (is_owner(uid) or is_admin(uid) or await _is_group_admin_user(context, chat_id, uid)):
+        names = ", ".join(missing[:10]) if missing else "required channel/group"
+        await _dm_text(context, uid, ui_box_html("Join Required", f"Please join: {h(names)}", emoji="⚠️"), reply_markup=_required_join_kb())
+        with contextlib.suppress(Exception):
+            await update.message.delete()
+        return
+
+    reply = update.message.reply_to_message
+    inline = " ".join(context.args).strip()
+
+    token = _make_token()
+    store = _pending_store(context)
+    preview = inline or "Solve this message/quiz"
+
+    if reply and getattr(reply, 'poll', None):
+        qtext, options, qexpl = _poll_text_for_sh(reply.poll)
+        official_ans = 0
+        with contextlib.suppress(Exception):
+            if getattr(reply.poll, 'type', '') == 'quiz' and getattr(reply.poll, 'correct_option_id', None) is not None:
+                official_ans = int(reply.poll.correct_option_id) + 1
+        store[token] = {
+            "uid": uid,
+            "chat_id": chat_id,
+            "kind": "poll",
+            "payload": {
+                "question": qtext,
+                "options": options,
+                "official_ans": official_ans,
+                "official_expl": qexpl,
+            },
+        }
+        preview = qtext or preview
+    else:
+        prompt = inline
+        if reply:
+            base = (reply.text or reply.caption or "").strip()
+            if inline and base:
+                prompt = f"Context:\n{base}\n\nQuestion:\n{inline}"
+            elif base:
+                prompt = base
+        if not (prompt or "").strip():
+            await _dm_text(context, uid, ui_box_html("Usage", "Use <code>/sh your question</code> or reply to a message/quiz with <code>/sh</code>.", emoji="ℹ️"))
+            with contextlib.suppress(Exception):
+                await update.message.delete()
+            return
+        store[token] = {
+            "uid": uid,
+            "chat_id": chat_id,
+            "kind": "text",
+            "payload": {"text": prompt},
+        }
+        preview = prompt
+
+    kb = _solver_picker_kb(token)
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=ui_box_html("Which AI model?", f"<code>{h(preview[:100])}</code>", emoji="🧠"),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=kb,
+        reply_to_message_id=(reply.message_id if reply else update.message.message_id),
+        allow_sending_without_reply=True,
+    )
+    asyncio.create_task(_auto_delete_after(context.bot, chat_id, [sent.message_id], 300))
+
+
+async def cmd_porag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat or update.effective_chat.type not in ("group", "supergroup"):
+        return
+    uid = update.effective_user.id if update.effective_user else 0
+    if not await _is_group_admin_user(context, update.effective_chat.id, uid):
+        await _dm_text(context, uid, ui_box_html("Unauthorized", "Only a group admin or the bot owner can use /porag.", emoji="⚠️"))
+        with contextlib.suppress(Exception):
+            await update.message.delete()
+        return
+    if not update.message.reply_to_message:
+        await _dm_text(context, uid, ui_box_html("Usage", "Reply to the first message you want to delete, then send <code>/porag</code>.", emoji="ℹ️"))
+        with contextlib.suppress(Exception):
+            await update.message.delete()
+        return
+    start_id = int(update.message.reply_to_message.message_id)
+    end_id = int(update.message.message_id)
+    total = end_id - start_id + 1
+    if total > 150:
+        await _dm_text(context, uid, ui_box_html("Too Many Messages", "Please delete at most 150 messages at a time.", emoji="⚠️"))
+        with contextlib.suppress(Exception):
+            await update.message.delete()
+        return
+    deleted = 0
+    for mid in range(start_id, end_id + 1):
+        try:
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=mid)
+            deleted += 1
+        except Exception:
+            pass
+    await _dm_text(context, uid, ui_box_html("Messages Deleted", f"Deleted: <code>{deleted}</code>", emoji="🧹"))
+
+
+async def cmd_tutorial(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat or update.effective_chat.type not in ("group", "supergroup"):
+        return
+    uid = update.effective_user.id if update.effective_user else 0
+    if not await _is_group_admin_user(context, update.effective_chat.id, uid):
+        with contextlib.suppress(Exception):
+            await update.message.delete()
+        return
+    text = (
+        "Group rules:\n"
+        "1) Use /probaho_on to enable group AI.\n"
+        "2) Members ask only with /sh.\n"
+        "3) AI replies auto-delete after 5 minutes.\n"
+        "4) Other bot commands work only in inbox.\n"
+        "5) Reply to a start message with /porag to delete a range."
+    )
+    with contextlib.suppress(Exception):
+        await update.message.reply_text(text)
+    with contextlib.suppress(Exception):
+        await update.message.delete()
+
+
+async def on_tutorial_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.callback_query:
+        return
+    q = update.callback_query
+    uid = q.from_user.id if q.from_user else 0
+    chat_id = q.message.chat_id if q.message else 0
+    if not await _is_group_admin_user(context, chat_id, uid):
+        with contextlib.suppress(Exception):
+            await q.answer("Admins only.", show_alert=True)
+        return
+    text = (
+        "Use /probaho_on in this group.\n"
+        "Members can then ask AI using /sh text অথবা reply + /sh.\n"
+        "All other bot tools stay in inbox/private.\n"
+        "Use /probaho_off to stop group AI."
+    )
+    with contextlib.suppress(Exception):
+        await q.answer(text, show_alert=True)
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cmu = getattr(update, 'my_chat_member', None)
+    if not cmu:
+        return
+    try:
+        old_status = cmu.old_chat_member.status
+        new_status = cmu.new_chat_member.status
+        chat = cmu.chat
+        actor = cmu.from_user
+    except Exception:
+        return
+    if new_status in ("member", "administrator") and old_status in ("left", "kicked") and chat.type in ("group", "supergroup"):
+        actor_name = actor.first_name if actor else "Admin"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📘 Tutorial", callback_data="tutorial:show")]])
+        with contextlib.suppress(Exception):
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=f"ধন্যবাদ {h(actor_name)}, {h(BOT_BRAND)} বটটি group-এ add করার জন্য। Admin guide দেখতে নিচের button ব্যবহার করুন.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+            )
+
+
+@require_admin
+async def cmd_buffercount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    await info_html(update, "Buffer Status", f"Total buffered: <code>{buffer_count(uid)}</code>", emoji="ℹ️")
+
+
+def _private_filter(base_filter):
+    return filters.ChatType.PRIVATE & base_filter
+
+
+def _group_filter(base_filter):
+    return (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP) & base_filter
+
+
+def build_app() -> Application:
+    db_init()
+    with contextlib.suppress(Exception):
+        extra_db_init()
+    from telegram.ext import ChatMemberHandler
+    builder = ApplicationBuilder().token(BOT_TOKEN)
+    try:
+        builder = builder.concurrent_updates(64)
+    except Exception:
+        pass
+    app = builder.build()
+
+    # Global guards
+    app.add_handler(MessageHandler(filters.ALL, global_maintenance_guard), group=-100)
+    app.add_handler(MessageHandler(_group_filter(filters.COMMAND), group_command_guard), group=-90)
+
+    # Callbacks
+    app.add_handler(CallbackQueryHandler(on_solver_callback, pattern=r"^solve:"))
+    app.add_handler(CallbackQueryHandler(on_genquiz_callback, pattern=r"^genquiz:"))
+    app.add_handler(CallbackQueryHandler(on_required_verify_callback, pattern=r"^req:verify$"))
+    app.add_handler(CallbackQueryHandler(on_emoji_quiz_callback, pattern=r"^eq:"))
+    app.add_handler(CallbackQueryHandler(on_image_react_callback, pattern=r"^imgreact:"))
+    app.add_handler(CallbackQueryHandler(on_tutorial_callback, pattern=r"^tutorial:show$"))
+
+    # Private public commands
+    app.add_handler(_cmdh("start", cmd_start, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("help", cmd_help, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("commands", cmd_commands, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("features", cmd_features, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("ask", cmd_ask, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("scanhelp", cmd_scanhelp, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("vision_on", cmd_vision_on, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("vision_off", cmd_vision_off, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("solve_on", cmd_solve_on, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("solve_off", cmd_solve_off, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("explain_on", cmd_explain_on, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("explain_off", cmd_explain_off, filters=filters.ChatType.PRIVATE))
+
+    # Owner/private
+    app.add_handler(_cmdh("quizprefix", cmd_quizprefix, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("quizlink", cmd_quizlink, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("addadmin", cmd_addadmin, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("removeadmin", cmd_removeadmin, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("grantall", cmd_grantall, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("revokeall", cmd_revokeall, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("grantvision", cmd_grantvision, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("revokevision", cmd_revokevision, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("ownerstats", cmd_ownerstats, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("users", cmd_users, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("maintenance_on", cmd_maintenance_on, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("maintenance_off", cmd_maintenance_off, filters=filters.ChatType.PRIVATE))
+
+    # Admin/private
+    app.add_handler(_cmdh("filter", cmd_filter, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("done", cmd_done, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("clear", cmd_clear, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("buffercount", cmd_buffercount, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("addchannel", cmd_addchannel, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("listchannels", cmd_listchannels, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("removechannel", cmd_removechannel, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("setprefix", cmd_setprefix, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("setexplink", cmd_setexplink, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("post", cmd_post, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("postemoji", cmd_postemoji, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("emojipost", cmd_postemoji, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("imgreact", cmd_imgreact, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("broadcast", cmd_broadcast, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("adminpanel", cmd_adminpanel, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("reply", cmd_reply, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("close", cmd_close, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("ban", cmd_ban, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("unban", cmd_unban, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("banned", cmd_banned, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("private_send", cmd_private_send, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("send_private", cmd_private_send, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("usersd", cmd_usersd, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("addrequired", cmd_addrequired, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("delrequired", cmd_delrequired, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("listrequired", cmd_listrequired, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("himusai_on", cmd_himusai_on, filters=filters.ChatType.PRIVATE))
+    app.add_handler(_cmdh("himusai_off", cmd_himusai_off, filters=filters.ChatType.PRIVATE))
+
+    # Private message handlers only
+    app.add_handler(MessageHandler(_private_filter(filters.POLL), handle_poll))
+    app.add_handler(MessageHandler(_private_filter(filters.POLL), handle_user_poll_solver), group=1)
+    app.add_handler(MessageHandler(_private_filter(filters.PHOTO), handle_image))
+    app.add_handler(MessageHandler(_private_filter(filters.Document.IMAGE), handle_image))
+    app.add_handler(MessageHandler(_private_filter(filters.TEXT & (~filters.COMMAND)), handle_text))
+    app.add_handler(MessageHandler(_private_filter(filters.TEXT & (~filters.COMMAND)), handle_user_text_unusual), group=1)
+
+    # Group-only handlers
+    app.add_handler(_cmdh("probaho_on", cmd_probaho_on, filters=(filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)))
+    app.add_handler(_cmdh("probaho_off", cmd_probaho_off, filters=(filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)))
+    app.add_handler(_cmdh("sh", cmd_sh, filters=(filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)))
+    app.add_handler(_cmdh("porag", cmd_porag, filters=(filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)))
+    app.add_handler(_cmdh("tutorial", cmd_tutorial, filters=(filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)))
+    app.add_handler(ChatMemberHandler(on_my_chat_member, chat_member_types=ChatMemberHandler.MY_CHAT_MEMBER))
+
+    app.add_error_handler(on_error)
+    return app
+
+# ===== END ULTRA GROUP/MAINTENANCE PATCH v6 =====
+
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
