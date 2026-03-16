@@ -69,7 +69,7 @@ from telegram.ext import (
 # ✅ HARD-CODED CONFIG
 # =========================================================
 BOT_TOKEN = "8286585007:AAHz1NIOXIbkBATy9qdcrQtHNr0DauL325U"  # set in Pella Env Vars
-OWNER_ID = 8389621809  # your Telegram numeric user id
+OWNER_ID = 8389621809 , 8535385246 # your Telegram numeric user id
 
 OWNER_CONTACT = "@Your_Himus"
 BOT_BRAND = "প্রবাহ"
