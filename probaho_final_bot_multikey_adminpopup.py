@@ -139,8 +139,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()  # set in Render Enviro
 # GEMINI_MODEL_TEXT = "models/gemini-2.5-flash"
 
 # অপশন ২: পাওয়ারফুল এবং হাই লিমিট (Pro) - আপনার স্ক্রিনশট অনুযায়ী এটি এখন ব্যবহার করা উচিত
-GEMINI_MODEL_VISION = "models/gemini-2.5-flash"
-GEMINI_MODEL_TEXT = "models/gemini-2.5-flash"
+GEMINI_MODEL_VISION = "models/gemini-3-flash"
+GEMINI_MODEL_TEXT = "models/gemini-3-flash"
 ########-------------------------------------------
 GEMINI_TIMEOUT_SECONDS = 60
 GEMINI_TEXT_TIMEOUT_SECONDS = 25  # faster text responses
