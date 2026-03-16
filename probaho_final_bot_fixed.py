@@ -128,7 +128,7 @@ START_TIME = time.time()  # process start time (uptime)
 # ⚠️ Security note: If you share this file, your keys can leak.
 GEMINI3_HTTP_URL = "http://127.0.0.1:5000/api/ask"  # optional
 GEMINI3_HTTP_TIMEOUT = 60
-GEMINI_API_KEY = "AIzaSyCdfVvpLA3ynViRjqw8mM1kDQRY2jLVCF8"  # set in Pella Env Vars
+GEMINI_API_KEY = "AIzaSyCFtsMEMjLsb3ZJGjipq6ecrtPnmRhiXoU"  # set in Pella Env Vars
 # Free & stable vision model
 # ---------------------------
 # MODEL CONFIGURATION (Switch here easily)
