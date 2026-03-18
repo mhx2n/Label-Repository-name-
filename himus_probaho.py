@@ -13106,8 +13106,8 @@ def usage_box(command: str, args: str = "", description: str = "") -> str:
 
 def _unauthorized_staff_text() -> str:
     return (
-        "This bot is currently restricted for staff operations. Please use <code>/q [message]</code> for support.\n"
-        "If you want to enable private AI solving, use <code>/solve_on</code>.\n"
+        "This bot is currently restricted for staff operations. Please use <code>.q [message]</code> for support.\n"
+        "If you want to enable private AI solving, use <code>.aion</code>.\n"
         f"If you genuinely need access, contact the owner: <code>{h(OWNER_CONTACT)}</code>"
     )
 
@@ -13117,7 +13117,7 @@ async def warn_unauthorized(update: Update, reason: str = "") -> None:
     extra = (reason or "").strip()
     if extra and extra not in body and "restricted for staff operations" not in extra.lower():
         body = f"{body}\n\n{h(extra)}"
-    await warn(update, "Unauthorized", body)
+    await warn_html(update, "Unauthorized", body)
 
 
 def _private_help_text(uid: int) -> str:
@@ -13230,7 +13230,7 @@ async def cmd_solve_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await warn(update, "Not Available", "Private AI solving is reserved for standard users. Staff workflows remain unchanged.")
         return
     set_solver_mode_on(uid, True)
-    await ok_html(update, "AI Solving Enabled", f"Private academic solving is now active. Send your question directly in inbox. Disable it anytime with {_display_code('solve_off')}.", emoji="🧠")
+    await ok_html(update, "AI Solving Enabled", "Private academic solving is now active. Send your question directly in inbox. Disable it anytime with<code>.aioff</code>.", emoji="🧠")
 
 
 async def cmd_solve_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -13245,7 +13245,7 @@ async def cmd_solve_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await warn(update, "Not Available", "Private AI solving is reserved for standard users.")
         return
     set_solver_mode_on(uid, False)
-    await ok_html(update, "AI Solving Disabled", f"Private academic solving has been turned off. Re-enable it anytime with {_display_code('solve_on')}.", emoji="🧠")
+    await ok_html(update, "AI Solving Disabled", "Private academic solving has been turned off. Re-enable it anytime with<code>.aion</code>.", emoji="🧠")
 
 
 async def cmd_probaho_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
