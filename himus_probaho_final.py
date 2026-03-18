@@ -13822,8 +13822,6 @@ def main():
     with contextlib.suppress(Exception):
         threading.Thread(target=_run_render_health_server, daemon=True).start()
     app = build_app()
-    with contextlib.suppress(Exception):
-        asyncio.run(install_default_command_scopes(app))
     start_github_backup_worker()
     with contextlib.suppress(Exception):
         _send_pending_restart_notice_via_http()
